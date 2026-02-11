@@ -1,3 +1,29 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+Dipole Mapping of the Local Hubble Expansion (Analysis Pipeline)
+
+This script performs a generalized least-squares (GLS) fit of the local Hubble
+expansion field using Type Ia Supernovae data. It supports:
+- Decomposition into Monopole, Kinematic Dipole (1/z), and Texture Dipole (constant).
+- Tomographic binning.
+- Full covariance matrix support.
+- Robustness tests: Influence diagnostics, Directional Jackknife, Constant-N tests.
+- Null hypothesis testing via footprint-aware permutations.
+
+Usage:
+    python h0_dipole.py --dat data.txt --cov cov.txt --zmin 0.0 --zmax 0.15 ...
+
+Author:  Michaël Vaillant
+Affil:   Meta-Connexions, Toulouse, France
+License: MIT
+Version: 6.4.0
+DOI:     10.5281/zenodo.18603301
+Paper:   "Dipole mapping of the local Hubble expansion", Vaillant (2026)
+
+Dependencies:
+    numpy, scipy, matplotlib
+"""
 import argparse, math
 import numpy as np
 import sys, time
@@ -15,8 +41,8 @@ EQ2GAL = np.array([
 ], dtype=float)
 
 # Anti–Great Attractor (approx.)
-AGA_L = 145.0   # deg
-AGA_B = 7.0     # deg
+AGA_L = 145.3   # deg
+AGA_B = 7.2     # deg
 
 # Global column name cache, filled once in main()
 RA_COL = DEC_COL = MU_COL = MUERR_COL = Z_COL = None
@@ -522,7 +548,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     else:
         ra_mK = dec_mK = l_mK = b_mK = float("nan")
 
-    # --- p-values: ddl depend on whether you fixed axes ---
+    # --- p-values: ddl depend on whether axes are fixed ---
     dof_tex = 1 if (tex_fix is not None) else 3
     dof_kin = 1 if (kin_fix is not None) else 3
     # "mix vs mono": add (tex block) + (kin block)
@@ -538,24 +564,15 @@ def fit_dipole(tab, idx, args, cov_full=None):
     else:
         p_kin = chi2_sf_df3(dchi2_kin)
 
-    # mix: only df=6 or df=2 are possible here (with your options)
+    # mix: only df=6 or df=2 are possible here 
     if dof_mix == 6:
-        p_mix = chi2_sf_df6(dchi2_mix) # (si vous ajoutez la fonction df6)
+        p_mix = chi2_sf_df6(dchi2_mix) 
     elif dof_mix == 4:
-        p_mix = chi2_sf_df4(dchi2_mix) # <--- AJOUTER CECI
+        p_mix = chi2_sf_df4(dchi2_mix) 
     elif dof_mix == 2:
-        p_mix = math.exp(-0.5*max(0.0, dchi2_mix)) # chi2_sf_df2(dchi2_mix) # (ou votre formule exp)
+        p_mix = math.exp(-0.5*max(0.0, dchi2_mix)) 
     else:
         p_mix = float("nan")    
-    
-    # if dof_mix == 6:
-    #     # no closed form helper for df=6 here; keep NaN unless you add one
-    #     p_mix = float("nan")
-    # elif dof_mix == 2:
-    #     # df=2: SF(x)=exp(-x/2)
-    #     p_mix = math.exp(-0.5*max(0.0, dchi2_mix))
-    # else:
-    #     p_mix = float("nan")
 
     z1_tex = norm_isf(p_tex) if (0 < p_tex < 1 and math.isfinite(p_tex)) else float("nan")
 
@@ -573,7 +590,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     else:
         p_add_tex_given_kin = chi2_sf_df3(dchi2_add_tex_given_kin)
 
-    # --- p-values: ddl depend on whether you fixed axes ---
+    # --- p-values: ddl depend on whether axes are fixed ---
     dof_tex = 1 if (tex_fix is not None) else 3
     dof_kin = 1 if (kin_fix is not None) else 3
     dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)  # 2 or 6
@@ -588,7 +605,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
     z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
 
-    # MIX (df=2 or 6)  -> you DO have closed forms for both
+    # MIX (df=2 or 6)  -> closed forms for both
     p_mix = chi2_sf(dchi2_mix, dof_mix)
     z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
     z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
@@ -628,7 +645,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
         chi2_kin=chi2_kin, dchi2_kin=dchi2_kin, p_kin=p_kin, dof_kin=dof_kin,
         A_mu_kin=A_mu_kin, ra_kin=ra_k, dec_kin=dec_k, l_kin=l_k, b_kin=b_k, v_bulk=v_bulk,
 
-        # legacy/compat keys for kinematic (FIXES YOUR KeyError)
+        # legacy/compat keys for kinematic
         p3_kin=p_kin, z1_3_kin=z1_kin, z2_3_kin=z2_kin,
 
         # mixed
@@ -871,8 +888,8 @@ def save_and_plot_null(stats, obs_val, out_root):
         ax.hist(stats, bins=50, density=True, alpha=0.6,
                 label="Null (permutations)")
 
-        # Optional "reference" curve (NOT a theory here).
-        # Skip it for MAX (no simple df), and use df=6 for MIX if you want.
+        # Optional "reference" curve 
+        # Skip it for MAX (no simple df)
         show_ref = True
         df = 3
         if out_root.endswith("_MIX"):
@@ -1266,7 +1283,7 @@ def permute_pvalue_whitened(yw, Q0, Q, dchi2_obs, nperm, seed=0, progress=True, 
             if v >= obs[k]:
                 ge[k] += 1
 
-        # Define dmax consistently with what you requested (look-elsewhere over req)
+        # Define dmax consistently
         v_max = max(d[k] for k in req)
         stats_max.append(v_max)
 
@@ -1679,32 +1696,31 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
     unless use_cov=True.
     We lock H0 to the baseline isotropic best-fit at the current args.zmin.
     """
-# Récupération des noms de colonnes détectés dans le main()
+    # Retrieve column names detected in main()
     global Z_COL, RA_COL, DEC_COL, MU_COL, MUERR_COL
     
-    # Lecture sécurisée des colonnes (tab est un structured array)
+    # Safe column access (tab is a structured array)
     z     = np.array(tab[Z_COL], float)
     ra    = np.array(tab[RA_COL], float)
     dec   = np.array(tab[DEC_COL], float)
     muerr = np.array(tab[MUERR_COL], float)
     mu    = np.array(tab[MU_COL], float)
 
-    # Calcul vectoriel de la latitude galactique pour le masque
-    # (plus rapide et évite les erreurs de fonctions scalaires)
+    # Vectorized galactic latitude calculation for masking
     n_eq_temp = unitvec_from_radec(ra, dec)
     n_gal_temp = n_eq_temp @ EQ2GAL.T
     # b_gal en degrés
     b_gal = np.degrees(np.arcsin(np.clip(n_gal_temp[:, 2], -1.0, 1.0)))
 
-    # Gestion de la colonne poussière (si nécessaire)
+    # Handle dust column (if required)
     ebv = np.zeros_like(z)
     if args.dustcut is not None and args.dustcut > 0:
-        # On cherche la colonne si args.dustcol n'est pas fourni explicitement
+        # Search for column if args.dustcol is not explicitly provided
         dcol = args.dustcol if args.dustcol else find_col(list(tab.dtype.names), ["MWEBV","mwebv","E_BV","ebv"])
         if dcol and (dcol in tab.dtype.names):
             ebv = np.array(tab[dcol], float)
 
-    # Création du masque de sélection de base
+    # Create base selection mask
     good = np.isfinite(z) & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(muerr)
     good &= (z >= 0.0) & (z <= args.zmax)
     
@@ -1714,7 +1730,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
     if args.dustcut is not None and args.dustcut > 0:
         good &= (ebv <= args.dustcut)
 
-    # --- Baseline H0 (at current args.zmin) using existing pipeline ---
+    # Baseline H0 (at current args.zmin) using existing pipeline
     idx_base = np.where(good & (z > args.zmin))[0]
     if len(idx_base) < 30:
         print("constN: baseline selection too small.")
@@ -1724,7 +1740,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
     r_base = fit_dipole(tab, idx_base, args, cov_full=cov_full, mode="mono")
     H0_ref = r_base["H0"]
 
-    # --- Build candidate sets per zmin ---
+    # Build candidate sets per zmin
     idx_sets = []
     for zmin in zmins:
         idx = np.where(good & (z > zmin))[0]
@@ -1734,7 +1750,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
     if N0 and N0 > 0:
         N0_eff = int(N0)
     else:
-        # Si N0=0, on prend la taille du plus petit set pour uniformiser
+        # If N0=0, use the size of the smallest set for uniformity
         N0_eff = int(min(sizes)) if sizes else 0
         
     if N0_eff < 30:
@@ -1743,7 +1759,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
 
     rng = np.random.default_rng(seed)
 
-    # --- Precompute arrays (all-sky) for speed ---
+    # Precompute arrays (all-sky) for speed
     n_eq_all = unitvec_from_radec(ra, dec)
     mu_th_all = hubble_mu_model(z, H0_ref, q0=args.q0)
     y_all = mu - mu_th_all
@@ -1755,7 +1771,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
             var = var + args.sigint**2
         if getattr(args, "sigv", 0.0) > 0:
             cz = 299792.458 * z
-            # Eviter division par zero
+            # Avoid division by zero
             sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
             var = var + sigmu_v**2
         Ldiag = np.sqrt(np.maximum(var, 1e-30))
@@ -1766,13 +1782,11 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
           f"{'full-cov' if use_cov else 'diag'}; H0 locked={H0_ref:.2f}) ===")
     print("zmin    | N(zmin) | median Δχ² | 90% Δχ² | median Δθ_axis | 90% Δθ_axis")
 
-    # --- Baseline Axis Reference ---
-    # On refit sur un sous-échantillon N0 de la "baseline" (zmin le plus bas)
-    # pour avoir une référence comparable en statistique.
+    # Baseline Axis Reference
     zmin_ref = float(min(zmins))
     idx_ref_pool = np.where(good & (z > zmin_ref))[0]
     
-    # Si le pool de ref est trop petit, on prend tout ce qu'on a (safe-guard)
+    # If ref pool is too small, take everything (safe-guard)
     if len(idx_ref_pool) < N0_eff:
         idx_ref = idx_ref_pool
     else:
@@ -2045,8 +2059,6 @@ def main():
         if cov_full.shape[0] != len(tab):
                     raise RuntimeError(f"FATAL: Covariance size ({cov_full.shape[0]}) does not match Data table length ({len(tab)}). Check inputs.")
         
-    # print(f"[ARGS] use_cov={args.use_cov}  cov='{args.cov}'  permute={args.permute}  permute_whitened={args.permute_whitened}")
-
     # -------- scan mode --------
     def parse_bins(s):
         # "0-0.03,0.03-0.06" -> [(0,0.03),(0.03,0.06)]
@@ -2318,7 +2330,7 @@ def main():
                 f"Δχ²_kin={sum_fix_kin:.3f}  Δχ²_mix={sum_fix_mix:.3f}"
             )
 
-        # Each bin fitted independently (axes may float unless you passed --fix_*_axis)
+        # Each bin fitted independently (axes may float unless --fix_*_axis)
         print("=== z bins (each bin fitted independently) ===")
         print(
             "zbin           N     H0     dChi2_tex  A_tex     l_tex   b_tex   "
@@ -2731,12 +2743,6 @@ def main():
             deq_tex = (EQ2GAL.T @ dgal).astype(float)
             proj_tex = (n @ deq_tex).astype(float)
 
-        if kin_fix is not None:
-            l0,b0 = kin_fix
-            dgal = _uvec_from_lb(l0,b0)
-            deq_kin = (EQ2GAL.T @ dgal).astype(float)
-            proj_kin = (n @ deq_kin).astype(float)
-
         X0 = np.ones((len(dmu),1), float)
 
         if tex_fix is None:
@@ -2797,7 +2803,7 @@ def main():
         Qkin = precompute_Q(Xkinw)
         Qmix = precompute_Q(Xmixw)
 
-        # observed dchi2 in whitened space (these are the lines you referenced)
+        # observed dchi2 in whitened space 
         dchi2_tex_obs = chi2_from_Q(yw, Q0) - chi2_from_Q(yw, Qtex)
         dchi2_kin_obs = chi2_from_Q(yw, Q0) - chi2_from_Q(yw, Qkin)
         dchi2_mix_obs = chi2_from_Q(yw, Q0) - chi2_from_Q(yw, Qmix)
@@ -2945,7 +2951,7 @@ def main():
             print("  top MIX dchi2:", ", ".join([f"{v[0]:.4f}" for v in top['mix'][:8]]))
             print("  top MAX dchi2:", ", ".join([f"{v[0]:.4f}" for v in top['max'][:8]]))
 
-            # --- Keep MW checks (do NOT include in MAX unless you really want that) ---
+            # --- Keep MW checks ---
             if args.mwcheck and (Qmw is not None) and (Qmwdip is not None):
                 if args.permute_within_survey:
                     p_mw, ge_mw, max_mw, gap_mw, top_mw = permute_pvalue_within_survey_whitened(
