@@ -5,7 +5,7 @@ Dipole Mapping of the Local Hubble Expansion (Analysis Pipeline)
 
 This script performs a generalized least-squares (GLS) fit of the local Hubble
 expansion field using Type Ia Supernovae data. It supports:
-- Decomposition into Monopole, Kinematic Dipole (1/z), and Texture Dipole (constant).
+- Decomposition into Monopole, Kinematic Dipole (1/z), and Constant-amplitude (TEX) dipole (redshift-independent template).
 - Tomographic binning.
 - Full covariance matrix support.
 - Robustness tests: Influence diagnostics, Directional Jackknife, Constant-N tests.
@@ -17,7 +17,7 @@ Usage:
 Author:  Michaël Vaillant
 Affil:   Meta-Connexions, Toulouse, France
 License: MIT
-Version: 6.4.0
+Version: 6.5.0
 DOI:     10.5281/zenodo.18603301
 Paper:   "Dipole mapping of the local Hubble expansion", Vaillant (2026)
 
@@ -47,6 +47,33 @@ AGA_B = 7.2     # deg
 # Global column name cache, filled once in main()
 RA_COL = DEC_COL = MU_COL = MUERR_COL = Z_COL = None
 
+def parse_bins(s):
+    """
+    Parses a string like '0.020-0.025,0.025-0.030' into a list of tuples.
+    Moved to global scope so it can be used by both main() and mocks.
+    """
+    if not s:
+        return []
+    out = []
+    for part in s.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            a, b = part.split("-", 1)
+        elif ":" in part:
+            a, b = part.split(":", 1)
+        else:
+            raise RuntimeError(f"Bad bin format in '{part}'. Use e.g. '0-0.03'")
+        
+        try:
+            lo = float(a.strip())
+            hi = float(b.strip())
+            out.append((lo, hi))
+        except ValueError:
+            raise RuntimeError(f"Could not parse floats in bin '{part}'")
+    return out
+    
 def _parse_lb(s):
     if not s: return None
     s = s.replace(" ", "")
@@ -406,7 +433,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     # --- design matrices ---
     X0 = np.ones((len(dmu), 1), float)  # monopole only
 
-    # texture: either full D·n (3 params) or fixed-axis A*(d·n) (1 param)
+    # Tex : either full D·n (3 params) or fixed-axis A*(d·n) (1 param)
     if tex_fix is None:
         X_tex = np.column_stack([np.ones(len(dmu)), n[:,0], n[:,1], n[:,2]])    # a0 + D·n
     else:
@@ -418,7 +445,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     else:
         X_kin = np.column_stack([np.ones(len(dmu)), proj_kin*zinv])                              # a0 + B*(d·n)/z
 
-    # mix: concatenate the chosen texture + chosen kinematic blocks
+    # mix: concatenate the chosen tex + chosen kinematic blocks
     mix_cols = [np.ones(len(dmu))]
     if tex_fix is None:
         mix_cols += [n[:,0], n[:,1], n[:,2]]
@@ -438,7 +465,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
 
     a0 = float(beta0[0])
 
-    # Keep legacy naming: "dip" = texture dipole component
+    # Keep legacy naming: "dip" = tex dipole component
     chi2_dip = chi2_tex
     dchi2_4dof = chi2_iso  - chi2_tex
     dchi2_tex  = chi2_mono - chi2_tex
@@ -450,7 +477,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     dchi2_add_kin_given_tex = chi2_tex - chi2_mix
     dchi2_add_tex_given_kin = chi2_kin - chi2_mix
 
-    # --- texture dipole params / vectors ---
+    # --- tex dipole params / vectors ---
     if tex_fix is None:
         D_vec = beta_tx[1:4].astype(float)
         A_mu = float(np.linalg.norm(D_vec))
@@ -551,50 +578,13 @@ def fit_dipole(tab, idx, args, cov_full=None):
     # --- p-values: ddl depend on whether axes are fixed ---
     dof_tex = 1 if (tex_fix is not None) else 3
     dof_kin = 1 if (kin_fix is not None) else 3
+    
     # "mix vs mono": add (tex block) + (kin block)
+    # df can be 2 (both fixed), 4 (one fixed, one free), or 6 (both free)
     dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)
 
-    if dof_tex == 1:
-        p_tex = chi2_sf_df1(dchi2_tex)
-    else:
-        p_tex = chi2_sf_df3(dchi2_tex)
-
-    if dof_kin == 1:
-        p_kin = chi2_sf_df1(dchi2_kin)
-    else:
-        p_kin = chi2_sf_df3(dchi2_kin)
-
-    # mix: only df=6 or df=2 are possible here 
-    if dof_mix == 6:
-        p_mix = chi2_sf_df6(dchi2_mix) 
-    elif dof_mix == 4:
-        p_mix = chi2_sf_df4(dchi2_mix) 
-    elif dof_mix == 2:
-        p_mix = math.exp(-0.5*max(0.0, dchi2_mix)) 
-    else:
-        p_mix = float("nan")    
-
-    z1_tex = norm_isf(p_tex) if (0 < p_tex < 1 and math.isfinite(p_tex)) else float("nan")
-
-    # conditional adds: ddl are those of the added block
-    dof_add_kin = 1 if (kin_fix is not None) else 3
-    dof_add_tex = 1 if (tex_fix is not None) else 3
-
-    if dof_add_kin == 1:
-        p_add_kin_given_tex = chi2_sf_df1(dchi2_add_kin_given_tex)
-    else:
-        p_add_kin_given_tex = chi2_sf_df3(dchi2_add_kin_given_tex)
-
-    if dof_add_tex == 1:
-        p_add_tex_given_kin = chi2_sf_df1(dchi2_add_tex_given_kin)
-    else:
-        p_add_tex_given_kin = chi2_sf_df3(dchi2_add_tex_given_kin)
-
-    # --- p-values: ddl depend on whether axes are fixed ---
-    dof_tex = 1 if (tex_fix is not None) else 3
-    dof_kin = 1 if (kin_fix is not None) else 3
-    dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)  # 2 or 6
-
+    # --- P-values & Sigmas (Cleaned version) ---
+    
     # TEX
     p_tex = chi2_sf(dchi2_tex, dof_tex)
     z1_tex = norm_isf(p_tex) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
@@ -605,36 +595,138 @@ def fit_dipole(tab, idx, args, cov_full=None):
     z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
     z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
 
-    # MIX (df=2 or 6)  -> closed forms for both
+    # MIX (df=2, 4, or 6)
     p_mix = chi2_sf(dchi2_mix, dof_mix)
     z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
     z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
 
-    # conditional adds: ddl are those of the added block
+    # Conditional adds (Nested models)
     dof_add_kin = 1 if (kin_fix is not None) else 3
     dof_add_tex = 1 if (tex_fix is not None) else 3
 
     p_add_kin_given_tex = chi2_sf(dchi2_add_kin_given_tex, dof_add_kin)
     p_add_tex_given_kin = chi2_sf(dchi2_add_tex_given_kin, dof_add_tex)
+    
+    # # --- p-values: ddl depend on whether axes are fixed ---
+    # dof_tex = 1 if (tex_fix is not None) else 3
+    # dof_kin = 1 if (kin_fix is not None) else 3
+    # # "mix vs mono": add (tex block) + (kin block)
+    # dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)
+
+    # if dof_tex == 1:
+    #     p_tex = chi2_sf_df1(dchi2_tex)
+    # else:
+    #     p_tex = chi2_sf_df3(dchi2_tex)
+
+    # if dof_kin == 1:
+    #     p_kin = chi2_sf_df1(dchi2_kin)
+    # else:
+    #     p_kin = chi2_sf_df3(dchi2_kin)
+
+    # # mix: only df=6 or df=2 are possible here 
+    # if dof_mix == 6:
+    #     p_mix = chi2_sf_df6(dchi2_mix) 
+    # elif dof_mix == 4:
+    #     p_mix = chi2_sf_df4(dchi2_mix) 
+    # elif dof_mix == 2:
+    #     p_mix = math.exp(-0.5*max(0.0, dchi2_mix)) 
+    # else:
+    #     p_mix = float("nan")    
+
+    # z1_tex = norm_isf(p_tex) if (0 < p_tex < 1 and math.isfinite(p_tex)) else float("nan")
+
+    # # conditional adds: ddl are those of the added block
+    # dof_add_kin = 1 if (kin_fix is not None) else 3
+    # dof_add_tex = 1 if (tex_fix is not None) else 3
+
+    # if dof_add_kin == 1:
+    #     p_add_kin_given_tex = chi2_sf_df1(dchi2_add_kin_given_tex)
+    # else:
+    #     p_add_kin_given_tex = chi2_sf_df3(dchi2_add_kin_given_tex)
+
+    # if dof_add_tex == 1:
+    #     p_add_tex_given_kin = chi2_sf_df1(dchi2_add_tex_given_kin)
+    # else:
+    #     p_add_tex_given_kin = chi2_sf_df3(dchi2_add_tex_given_kin)
+
+    # # --- p-values: ddl depend on whether axes are fixed ---
+    # dof_tex = 1 if (tex_fix is not None) else 3
+    # dof_kin = 1 if (kin_fix is not None) else 3
+    # dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)  # 2 or 6
+
+    # # TEX
+    # p_tex = chi2_sf(dchi2_tex, dof_tex)
+    # z1_tex = norm_isf(p_tex) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
+    # z2_tex = norm_isf(p_tex/2.0) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
+
+    # # KIN
+    # p_kin = chi2_sf(dchi2_kin, dof_kin)
+    # z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
+    # z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
+
+    # # MIX (df=2 or 6)  -> closed forms for both
+    # p_mix = chi2_sf(dchi2_mix, dof_mix)
+    # z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
+    # z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
+
+    # # conditional adds: ddl are those of the added block
+    # dof_add_kin = 1 if (kin_fix is not None) else 3
+    # dof_add_tex = 1 if (tex_fix is not None) else 3
+
+    # p_add_kin_given_tex = chi2_sf(dchi2_add_kin_given_tex, dof_add_kin)
+    # p_add_tex_given_kin = chi2_sf(dchi2_add_tex_given_kin, dof_add_tex)
 
     # H0-only -> (a0 + dip) comparison kept as before
     p4 = chi2_sf_df4(dchi2_4dof)
     z1_4 = norm_isf(p4) if (0.0 < p4 < 1.0) else float("nan")
     z2_4 = norm_isf(p4/2.0) if (0.0 < p4 < 1.0) else float("nan")
+    a0_mix = float(beta_mx[0])
+    
+    # error bars
+    # Mono (isotrope)
+    # 1. For Monopole model (a0_mono)
+    X0w = solve_lower(L, X0)
+    H0_mat = X0w.T @ X0w
+    
+    # Robust scalar extraction (fixes NumPy 1.25+ DeprecationWarning)
+    if np.ndim(H0_mat) == 0 or H0_mat.size == 1:
+        val = H0_mat.item()
+        var_a0_mono = 1.0 / val if val > 0 else float('inf')
+    else:
+        var_a0_mono = np.linalg.inv(H0_mat)[0, 0]
+        
+    err_a0_mono = math.sqrt(var_a0_mono)
 
+    # 2. For Mixed model (a0_mix)
+    Xmixw = solve_lower(L, X_mix)
+    Hmix_mat = Xmixw.T @ Xmixw
+    
+    # Invert matrix (size ~7x7) to get variance of the first parameter (intercept)
+    try:
+        Cov_mix = np.linalg.inv(Hmix_mat)
+        var_a0_mix = Cov_mix[0, 0] 
+        err_a0_mix = math.sqrt(max(0.0, var_a0_mix))
+    except np.linalg.LinAlgError:
+        err_a0_mix = float('nan') 
+    
     out = dict(
         N=len(dmu), H0=H0_best,
         chi2_iso=chi2_iso, chi2_mono=chi2_mono, chi2_dip=chi2_dip,
 
         dchi2_4=dchi2_4dof, p4=p4, z1_4=z1_4, z2_4=z2_4,
 
-        # texture (canonical keys)
+        # tex (canonical keys)
         dchi2_tex=dchi2_tex, p_tex=p_tex, z_tex=z1_tex, dof_tex=dof_tex,
 
-        # legacy/compat keys for texture (kept)
+        # legacy/compat keys for tex (kept)
         dchi2_3=dchi2_tex, p3=p_tex, z1_3=z1_tex, z2_3=z2_tex,
 
-        a0=a0, A_mu=A_mu, frac=frac,
+        a0=a0, 
+        a0_mix=a0_mix,              # Intercept from the full MIX model
+        err_a0_mono=err_a0_mono,    # Error on monopole intercept
+        err_a0_mix=err_a0_mix,      # Error on mix intercept
+        
+        A_mu=A_mu, frac=frac,
         ra=ra_hat, dec=dec_hat, l=l_hat, b=b_hat,
         surveycol=surv_name,
 
@@ -1692,221 +1784,485 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
                     use_cov=False, seed=0, dump_csv=None):
     """
     Constant-N test across zmin values.
-    For speed (and because this is a power-control), the default uses diagonal errors
-    unless use_cov=True.
-    We lock H0 to the baseline isotropic best-fit at the current args.zmin.
+
+    For each zmin, draw N0 objects from the pool (z > zmin) and compute, on the SAME
+    subsample:
+        Δχ² = χ²_mono - χ²_model
+    where "mono" is a0-only (intercept) and "model" ∈ {"tex","kin","mix"}.
+
+    H0 is LOCKED to a single baseline value (best isotropic H0 on the baseline pool),
+    so Δχ² measures only the dipole power at fixed H0.
+
+    Important:
+      - This function is self-contained (does NOT call fit_dipole inside the draws),
+        so it stays consistent with the locked H0 and with use_cov/diag choice.
+      - It also supports --fix_tex_axis / --fix_kin_axis (1-dof dipoles) consistently.
     """
-    # Retrieve column names detected in main()
     global Z_COL, RA_COL, DEC_COL, MU_COL, MUERR_COL
-    
-    # Safe column access (tab is a structured array)
+
+    # --- Read columns from structured array ---
     z     = np.array(tab[Z_COL], float)
     ra    = np.array(tab[RA_COL], float)
     dec   = np.array(tab[DEC_COL], float)
-    muerr = np.array(tab[MUERR_COL], float)
     mu    = np.array(tab[MU_COL], float)
+    muerr = np.array(tab[MUERR_COL], float)
 
-    # Vectorized galactic latitude calculation for masking
-    n_eq_temp = unitvec_from_radec(ra, dec)
-    n_gal_temp = n_eq_temp @ EQ2GAL.T
-    # b_gal en degrés
-    b_gal = np.degrees(np.arcsin(np.clip(n_gal_temp[:, 2], -1.0, 1.0)))
+    # --- Unit vectors (equatorial) + Galactic latitude for masks ---
+    n_eq_all  = unitvec_from_radec(ra, dec)              # (N,3) equatorial
+    n_gal_all = n_eq_all @ EQ2GAL.T                      # (N,3) galactic
+    b_gal = np.degrees(np.arcsin(np.clip(n_gal_all[:, 2], -1.0, 1.0)))
 
-    # Handle dust column (if required)
+    # --- Dust (optional) ---
     ebv = np.zeros_like(z)
     if args.dustcut is not None and args.dustcut > 0:
-        # Search for column if args.dustcol is not explicitly provided
         dcol = args.dustcol if args.dustcol else find_col(list(tab.dtype.names), ["MWEBV","mwebv","E_BV","ebv"])
         if dcol and (dcol in tab.dtype.names):
             ebv = np.array(tab[dcol], float)
 
-    # Create base selection mask
-    good = np.isfinite(z) & np.isfinite(ra) & np.isfinite(dec) & np.isfinite(muerr)
+    # --- Base mask (consistent with main) ---
+    good = (np.isfinite(z) & np.isfinite(ra) & np.isfinite(dec) &
+            np.isfinite(mu) & np.isfinite(muerr))
     good &= (z >= 0.0) & (z <= args.zmax)
-    
+
     if args.bcut is not None and args.bcut > 0:
         good &= (np.abs(b_gal) >= args.bcut)
-    
+
     if args.dustcut is not None and args.dustcut > 0:
         good &= (ebv <= args.dustcut)
 
-    # Baseline H0 (at current args.zmin) using existing pipeline
-    idx_base = np.where(good & (z > args.zmin))[0]
+    # --- Baseline selection: use the lowest zmin in the scan ---
+    zmin_ref = float(np.min(np.array(zmins, dtype=float)))
+    idx_base = np.where(good & (z > zmin_ref))[0]
     if len(idx_base) < 30:
         print("constN: baseline selection too small.")
         return
-    
-    # On fait un fit standard pour avoir le H0 de référence
-    r_base = fit_dipole(tab, idx_base, args, cov_full=cov_full, mode="mono")
-    H0_ref = r_base["H0"]
 
-    # Build candidate sets per zmin
-    idx_sets = []
-    for zmin in zmins:
-        idx = np.where(good & (z > zmin))[0]
-        idx_sets.append(idx)
+    # --- Build whitening for baseline (diag or full cov) ---
+    z_base = z[idx_base]
+    mu_base = mu[idx_base]
+    muerr_base = np.maximum(muerr[idx_base], 1e-6)
 
-    sizes = [len(x) for x in idx_sets]
-    if N0 and N0 > 0:
-        N0_eff = int(N0)
+    if use_cov and (cov_full is not None):
+        Cb = cov_full[np.ix_(idx_base, idx_base)].copy()
+        if args.sigint and args.sigint > 0:
+            Cb[np.diag_indices_from(Cb)] += args.sigint**2
+        if getattr(args, "sigv", 0.0) and getattr(args, "sigv", 0.0) > 0:
+            cz = C_LIGHT * np.maximum(z_base, 1e-6)
+            sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
+            Cb[np.diag_indices_from(Cb)] += sigmu_v**2
+        Lb = whiten_from_cov(Cb)
     else:
-        # If N0=0, use the size of the smallest set for uniformity
-        N0_eff = int(min(sizes)) if sizes else 0
-        
+        var = muerr_base**2
+        if args.sigint and args.sigint > 0:
+            var = var + args.sigint**2
+        if getattr(args, "sigv", 0.0) and getattr(args, "sigv", 0.0) > 0:
+            cz = C_LIGHT * np.maximum(z_base, 1e-6)
+            sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
+            var = var + sigmu_v**2
+        Lb = np.sqrt(np.maximum(var, 1e-30))
+
+    # --- Baseline H0: isotropic grid search (same as fit_dipole's first step) ---
+    H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
+    best = (1e300, None)
+    for H0 in H0_grid:
+        mu_th = hubble_mu_model(z_base, H0, q0=args.q0)
+        r = (mu_base - mu_th).astype(float)
+        chi2 = chi2_only(Lb, r)
+        if chi2 < best[0]:
+            best = (chi2, float(H0))
+    H0_ref = float(best[1])
+
+    # --- Precompute residuals with locked H0 ---
+    mu_th_all = hubble_mu_model(z, H0_ref, q0=args.q0)
+    y_all = (mu - mu_th_all).astype(float)
+
+    # --- Diag whitening (diag-only case) ---
+    if not (use_cov and (cov_full is not None)):
+        var_all = np.maximum(muerr, 1e-6)**2
+        if args.sigint and args.sigint > 0:
+            var_all = var_all + args.sigint**2
+        if getattr(args, "sigv", 0.0) and getattr(args, "sigv", 0.0) > 0:
+            cz = C_LIGHT * np.maximum(z, 1e-6)
+            sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
+            var_all = var_all + sigmu_v**2
+        Ldiag = np.sqrt(np.maximum(var_all, 1e-30))
+
+    # --- Fixed axes support (same convention as fit_dipole) ---
+    tex_fix = _parse_lb(getattr(args, "fix_tex_axis", ""))  # (l,b) or None
+    kin_fix = _parse_lb(getattr(args, "fix_kin_axis", ""))  # (l,b) or None
+
+    proj_tex_all = None
+    proj_kin_all = None
+    if tex_fix is not None:
+        l0, b0 = tex_fix
+        dgal = _uvec_from_lb(l0, b0)                 # (3,) in gal frame
+        deq_tex = (EQ2GAL.T @ dgal).astype(float)    # back to equatorial
+        proj_tex_all = (n_eq_all @ deq_tex).astype(float)
+    if kin_fix is not None:
+        l0, b0 = kin_fix
+        dgal = _uvec_from_lb(l0, b0)
+        deq_kin = (EQ2GAL.T @ dgal).astype(float)
+        proj_kin_all = (n_eq_all @ deq_kin).astype(float)
+
+    zinv_all = 1.0 / np.maximum(z, 1e-6)
+
+    def _antipode_lb(lb):
+        l0, b0 = lb
+        return ((float(l0) + 180.0) % 360.0, -float(b0))
+
+    def _vec_to_lb_equatorial(v):
+        v = np.asarray(v, dtype=float)
+        nrm = float(np.linalg.norm(v))
+        if not np.isfinite(nrm) or nrm <= 0.0:
+            return (float("nan"), float("nan"))
+        ueq = v / nrm
+        ugal = (EQ2GAL @ ueq).astype(float)
+        l = (math.degrees(math.atan2(float(ugal[1]), float(ugal[0]))) + 360.0) % 360.0
+        b = math.degrees(math.asin(max(-1.0, min(1.0, float(ugal[2])))))
+        return (float(l), float(b))
+
+    def _build_X_idx(idx_sub, mode_):
+        nsub = n_eq_all[idx_sub]
+        zinv = zinv_all[idx_sub]
+        ones = np.ones(len(idx_sub), dtype=float)
+
+        if mode_ == "mono":
+            return ones[:, None]
+
+        if mode_ == "tex":
+            if tex_fix is None:
+                return np.column_stack([ones, nsub[:, 0], nsub[:, 1], nsub[:, 2]])
+            return np.column_stack([ones, proj_tex_all[idx_sub]])
+
+        if mode_ == "kin":
+            if kin_fix is None:
+                return np.column_stack([ones, nsub[:, 0]*zinv, nsub[:, 1]*zinv, nsub[:, 2]*zinv])
+            return np.column_stack([ones, proj_kin_all[idx_sub]*zinv])
+
+        if mode_ == "mix":
+            cols = [ones]
+            # kinematic block first (same ordering as build_X)
+            if kin_fix is None:
+                cols += [nsub[:, 0]*zinv, nsub[:, 1]*zinv, nsub[:, 2]*zinv]
+            else:
+                cols += [proj_kin_all[idx_sub]*zinv]
+            # tex block
+            if tex_fix is None:
+                cols += [nsub[:, 0], nsub[:, 1], nsub[:, 2]]
+            else:
+                cols += [proj_tex_all[idx_sub]]
+            return np.column_stack(cols)
+
+        raise ValueError(f"constant_N_test: unsupported mode={mode_}")
+
+    def _axis_from_beta(beta, mode_):
+        """
+        Returns (l,b) in galactic deg, following fit_dipole conventions:
+          - if axis is fixed, flip to enforce positive amplitude
+          - if axis is free, use vector direction (max direction)
+        """
+        beta = np.asarray(beta, dtype=float)
+
+        if mode_ == "tex":
+            if tex_fix is not None:
+                amp = float(beta[1])
+                return tex_fix if (amp >= 0.0) else _antipode_lb(tex_fix)
+            return _vec_to_lb_equatorial(beta[1:4])
+
+        if mode_ == "kin":
+            if kin_fix is not None:
+                amp = float(beta[1])
+                return kin_fix if (amp >= 0.0) else _antipode_lb(kin_fix)
+            return _vec_to_lb_equatorial(beta[1:4])
+
+        if mode_ == "mix":
+            # We report TEX-axis by default (as the previous code did).
+            # Figure out where the TEX block starts.
+            kcols = 1 if (kin_fix is not None) else 3
+            tex_start = 1 + kcols
+            if tex_fix is not None:
+                amp = float(beta[tex_start])
+                return tex_fix if (amp >= 0.0) else _antipode_lb(tex_fix)
+            return _vec_to_lb_equatorial(beta[tex_start:tex_start+3])
+
+        return (float("nan"), float("nan"))
+
+    # --- Base axis reference (single fit on the baseline pool) ---
+    Xb = _build_X_idx(idx_base, model)
+    yb = y_all[idx_base]
+
+    # Use the same whitening choice as the draws:
+    if use_cov and (cov_full is not None):
+        # reuse baseline Cb/Lb already built above
+        L_for_axis = Lb
+    else:
+        L_for_axis = Ldiag[idx_base]
+
+    beta_b, _ = gls_fit_and_chi2(L_for_axis, Xb, yb)
+    base_axis = _axis_from_beta(beta_b, model)
+
+    # --- Pools per zmin ---
+    idx_sets = [np.where(good & (z > float(zmin)))[0] for zmin in zmins]
+    sizes = [len(x) for x in idx_sets]
+    N0_eff = int(N0) if (N0 and N0 > 0) else int(min(sizes)) if sizes else 0
+
     if N0_eff < 30:
         print(f"constN: common N0 too small ({N0_eff}).")
         return
 
     rng = np.random.default_rng(seed)
 
-    # Precompute arrays (all-sky) for speed
-    n_eq_all = unitvec_from_radec(ra, dec)
-    mu_th_all = hubble_mu_model(z, H0_ref, q0=args.q0)
-    y_all = mu - mu_th_all
-
-    # For diag-only, build diag variance once and reuse
-    if not use_cov:
-        var = muerr**2
-        if args.sigint and args.sigint > 0:
-            var = var + args.sigint**2
-        if getattr(args, "sigv", 0.0) > 0:
-            cz = 299792.458 * z
-            # Avoid division by zero
-            sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
-            var = var + sigmu_v**2
-        Ldiag = np.sqrt(np.maximum(var, 1e-30))
-
-    rows_out = []
     print("")
-    print(f"=== Constant-N test (model={model}, draws={draws}, N0={N0_eff}, " 
-          f"{'full-cov' if use_cov else 'diag'}; H0 locked={H0_ref:.2f}) ===")
+    print(f"=== Constant-N test (model={model}, draws={int(draws)}, N0={N0_eff}, "
+          f"{'full-cov' if (use_cov and cov_full is not None) else 'diag'}; H0 locked={H0_ref:.2f}) ===")
     print("zmin    | N(zmin) | median Δχ² | 90% Δχ² | median Δθ_axis | 90% Δθ_axis")
 
-    # Baseline Axis Reference
-    zmin_ref = float(min(zmins))
-    idx_ref_pool = np.where(good & (z > zmin_ref))[0]
-    
-    # If ref pool is too small, take everything (safe-guard)
-    if len(idx_ref_pool) < N0_eff:
-        idx_ref = idx_ref_pool
-    else:
-        idx_ref = rng.choice(idx_ref_pool, size=N0_eff, replace=False)
+    rows_out = []
 
-    # Reference fit χ² (diag or cov)
-    y_ref = y_all[idx_ref]
-    z_ref = z[idx_ref]
-    X_ref = build_X(n_eq_all[idx_ref], z_ref, mode=model)
-    
-    if use_cov and (cov_full is not None):
-        Cref = cov_full[np.ix_(idx_ref, idx_ref)].copy()
-        if args.sigint and args.sigint > 0:
-            Cref[np.diag_indices_from(Cref)] += args.sigint**2
-        if getattr(args, "sigv", 0.0) > 0:
-            cz = 299792.458 * z_ref
-            sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
-            Cref[np.diag_indices_from(Cref)] += sigmu_v**2
-        Lref = whiten_from_cov(Cref)
-    else:
-        Lref = Ldiag[idx_ref]
-        
-    _, chi2_ref, _, _ = whitened_ols_fit(Lref, X_ref, y_ref)
-
-    # Reference fit Axis (using fit_dipole logic)
-    r_axis_ref = fit_dipole(tab, idx_ref, args, cov_full=cov_full, mode="mono")
-    
-    if model == "kin":
-        # Handle cases where fit fails or returns NaN
-        l_k, b_k = r_axis_ref.get("l_kin", np.nan), r_axis_ref.get("b_kin", np.nan)
-        base_axis = (l_k, b_k)
-    elif model == "tex":
-        l_t, b_t = r_axis_ref.get("l", np.nan), r_axis_ref.get("b", np.nan)
-        base_axis = (l_t, b_t)
-    else:
-        # for mix, use TEX-like axis by default
-        l_m, b_m = r_axis_ref.get("l_mix_tex", np.nan), r_axis_ref.get("b_mix_tex", np.nan)
-        base_axis = (l_m, b_m)
-
-    # --- Scan Loop ---
     for zmin, idx_pool in zip(zmins, idx_sets):
+        zmin = float(zmin)
+
         if len(idx_pool) < N0_eff:
-            # Not enough SNe at this zmin to draw N0 sample
-            rows_out.append((float(zmin), int(len(idx_pool)), np.nan, np.nan, np.nan, np.nan))
+            rows_out.append((zmin, int(len(idx_pool)), np.nan, np.nan, np.nan, np.nan))
             print(f"{zmin:0.5f} | {len(idx_pool):>6} | (skip: N < N0)")
             continue
 
-        chi2_list = []
-        axis_list = []
-        
-        # Monte Carlo Draws
+        dchi2_list = []
+        dtheta_list = []
+
         for _ in range(int(draws)):
             idx_sub = rng.choice(idx_pool, size=N0_eff, replace=False)
-            y_sub = y_all[idx_sub]
-            z_sub = z[idx_sub]
-            X_sub = build_X(n_eq_all[idx_sub], z_sub, mode=model)
 
+            y_sub = y_all[idx_sub]
+
+            # Build X for mono + model on the SAME subsample
+            X_mono  = _build_X_idx(idx_sub, "mono")
+            X_model = _build_X_idx(idx_sub, model)
+
+            # Whitening for this subsample
             if use_cov and (cov_full is not None):
                 Csub = cov_full[np.ix_(idx_sub, idx_sub)].copy()
                 if args.sigint and args.sigint > 0:
                     Csub[np.diag_indices_from(Csub)] += args.sigint**2
-                if getattr(args, "sigv", 0.0) > 0:
-                    cz = 299792.458 * z_sub
+                if getattr(args, "sigv", 0.0) and getattr(args, "sigv", 0.0) > 0:
+                    z_sub = z[idx_sub]
+                    cz = C_LIGHT * np.maximum(z_sub, 1e-6)
                     sigmu_v = (5.0 / math.log(10.0)) * (args.sigv / np.maximum(cz, 1e-3))
                     Csub[np.diag_indices_from(Csub)] += sigmu_v**2
                 Lsub = whiten_from_cov(Csub)
             else:
                 Lsub = Ldiag[idx_sub]
 
-            _, chi2, _, _ = whitened_ols_fit(Lsub, X_sub, y_sub)
-            
-            # Δχ² against the reference at same N0
-            dchi2 = chi2_ref - chi2
-            chi2_list.append(dchi2)
+            _, chi2_mono  = gls_fit_and_chi2(Lsub, X_mono,  y_sub)
+            beta_md, chi2_model = gls_fit_and_chi2(Lsub, X_model, y_sub)
 
-        # Axis stability: perform exact fits fewer times (slow)
-        n_axis = max(10, min(50, int(draws // 4)))
-        
-        # Only check axis if base_axis is valid
-        if np.isfinite(base_axis[0]):
-            for _ in range(n_axis):
-                idx_sub = rng.choice(idx_pool, size=N0_eff, replace=False)
-                rr = fit_dipole(tab, idx_sub, args, cov_full=cov_full, mode="mono")
-                
-                if model == "kin":
-                    ax_curr = (rr.get("l_kin", np.nan), rr.get("b_kin", np.nan))
-                elif model == "tex":
-                    ax_curr = (rr.get("l", np.nan), rr.get("b", np.nan))
-                else:
-                    ax_curr = (rr.get("l_mix_tex", np.nan), rr.get("b_mix_tex", np.nan))
-                
-                if np.isfinite(ax_curr[0]):
-                    sep = angsep_lb_deg(base_axis[0], base_axis[1], ax_curr[0], ax_curr[1])
-                    axis_list.append(sep)
+            dchi2_list.append(float(chi2_mono - chi2_model))
 
-        chi2_arr = np.array(chi2_list, dtype=float)
-        axis_arr = np.array(axis_list, dtype=float)
+            # Axis stability (cheap: beta already computed)
+            if np.isfinite(base_axis[0]):
+                ax = _axis_from_beta(beta_md, model)
+                if np.isfinite(ax[0]):
+                    dtheta_list.append(float(angsep_lb_deg(base_axis[0], base_axis[1], ax[0], ax[1])))
 
-        med = float(np.median(chi2_arr)) if chi2_arr.size > 0 else np.nan
-        p90 = float(np.percentile(chi2_arr, 90)) if chi2_arr.size > 0 else np.nan
-        
-        medA = float(np.median(axis_arr)) if axis_arr.size > 0 else np.nan
-        p90A = float(np.percentile(axis_arr, 90)) if axis_arr.size > 0 else np.nan
+        dchi2_arr = np.array(dchi2_list, dtype=float)
+        dtheta_arr = np.array(dtheta_list, dtype=float)
+
+        med  = float(np.median(dchi2_arr)) if dchi2_arr.size else np.nan
+        p90  = float(np.percentile(dchi2_arr, 90)) if dchi2_arr.size else np.nan
+        medA = float(np.median(dtheta_arr)) if dtheta_arr.size else np.nan
+        p90A = float(np.percentile(dtheta_arr, 90)) if dtheta_arr.size else np.nan
 
         print(f"{zmin:0.5f} | {len(idx_pool):>6} | {med:>10.3f} | {p90:>8.3f} | "
               f"{medA:>13.2f}° | {p90A:>10.2f}°")
 
-        rows_out.append((float(zmin), int(len(idx_pool)), med, p90, medA, p90A))
+        rows_out.append((zmin, int(len(idx_pool)), med, p90, medA, p90A))
 
     if dump_csv and rows_out:
         import csv
         try:
             with open(dump_csv, "w", newline="", encoding="utf-8") as f:
                 wcsv = csv.writer(f)
-                wcsv.writerow(["zmin", "N_pool", "median_dchi2", "p90_dchi2", "median_dtheta", "p90_dtheta"])
+                wcsv.writerow(["zmin", "N_pool", "median_dchi2", "p90_dchi2", "median_dtheta_deg", "p90_dtheta_deg"])
                 for r in rows_out:
                     wcsv.writerow(r)
             print(f"(saved) {dump_csv}")
         except IOError as e:
             print(f"Error writing CSV: {e}")
+
+def run_null_mock_tomography(tab, base_mask, args, cov_full, zbin_results):
+    """
+    Null-footprint tomographic calibration (morphological / amplitude-based; bins 2&3 only).
+
+    We run the locked-axis tomography on correlated Gaussian noise realizations drawn on the
+    *same* footprint and with the *same* covariance model as the data, and we count how often
+    noise reproduces a simple 'shell-like' morphology using only bins #2 and #3:
+
+      - Peak (bin #2): signed A_tex is positive and >= observed A_tex in bin #2
+      - Extinction (bin #3): |A_tex| <= thresh_outer (fixed threshold, not data-tuned)
+
+    Notes:
+      - Uses only args.seed (no extra seed arg).
+      - Uses --nmock as the number of realizations; if --nmock is absent or <=1, defaults to 1000.
+      - Fits TEX-only per bin (X = [1, proj_tex]) to match the reported A_tex_fit logic.
+    """
+    # --- Default zbins if not provided ---
+    zbins_spec = getattr(args, "zbins", None)
+    if (zbins_spec is None) or (str(zbins_spec).strip() == ""):
+        zbins_spec = "0.020-0.025,0.025-0.030,0.030-0.035,0.035-0.040"
+    zb = parse_bins(zbins_spec)
+    if not zb:
+        raise RuntimeError(f"Invalid zbins spec: {zbins_spec}")
+
+    if len(zb) < 2:
+        raise RuntimeError("--null_mock_tomo needs at least two zbins.")
+    if len(zb) < 3:
+        # If user provided only two bins, treat them as (peak, outer).
+        i_peak, i_outer = 0, 1
+    else:
+        # Your intended definition: bins 2 and 3 of the provided list.
+        i_peak, i_outer = 1, 2
+
+    # --- Seed handling (use only args.seed) ---
+    seed = getattr(args, "seed", 0)
+    if seed is None:
+        seed = 0
+    seed = int(seed)
+    rng = np.random.default_rng(seed + 555)
+
+    # --- Number of mocks: reuse existing --nmock (no new CLI arg) ---
+    n_mocks = getattr(args, "nmock", None)
+    if n_mocks is None or int(n_mocks) <= 1:
+        n_mocks = 1000
+    n_mocks = int(n_mocks)
+
+    # --- Sanity checks (locked-axis tomography path) ---
+    if not getattr(args, "zbins_global", False):
+        raise RuntimeError("--null_mock_tomo requires --zbins_global (locked axes + global H0 path).")
+    if not (getattr(args, "fix_tex_axis", None) and getattr(args, "fix_kin_axis", None)):
+        raise RuntimeError("--null_mock_tomo requires --fix_tex_axis and --fix_kin_axis.")
+
+    # --- Build union selection (same union as zbins_global) ---
+    z_all = np.array(tab[Z_COL], float)
+    zlo_u = min(a for a, b in zb)
+    zhi_u = max(b for a, b in zb)
+    mU = base_mask & (z_all > zlo_u) & (z_all <= zhi_u)
+    idxU = np.where(mU)[0]
+    if idxU.size < 10:
+        raise RuntimeError("Not enough SNe in union of bins for null mock tomography.")
+
+    # --- Pull union arrays (geometry) ---
+    raU    = np.array(tab[RA_COL], float)[idxU]
+    decU   = np.array(tab[DEC_COL], float)[idxU]
+    muerrU = np.maximum(np.array(tab[MUERR_COL], float)[idxU], 1e-6)
+
+    # --- Sampling model: match covariance logic ---
+    use_cov = (cov_full is not None) and bool(getattr(args, "use_cov", False))
+    if use_cov:
+        CU = cov_full[np.ix_(idxU, idxU)].copy()
+        if args.sigint > 0:
+            CU[np.diag_indices_from(CU)] += args.sigint**2
+        LU = whiten_from_cov(CU)  # Cholesky factor L, so C = L L^T
+    else:
+        sig2U = muerrU * muerrU + args.sigint * args.sigint
+        LU = np.sqrt(sig2U)  # diag std vector
+
+    # --- Fixed TEX axis in equatorial frame ---
+    l_tex, b_tex = _parse_lb(args.fix_tex_axis)
+    dgal_tex = _uvec_from_lb(l_tex, b_tex)
+    deq_tex  = (EQ2GAL.T @ dgal_tex).astype(float)
+
+    nU = unitvec_from_radec(raU, decU)
+    proj_tex_U = (nU @ deq_tex).astype(float)
+    zU = np.array(tab[Z_COL], float)[idxU]
+
+    # --- Precompute the two target bins (peak=bin2, outer=bin3) ---
+    target_bins = [(i_peak, zb[i_peak]), (i_outer, zb[i_outer])]
+    bin_pre = {}
+    for (ibin, (zlo, zhi)) in target_bins:
+        mB = (zU > zlo) & (zU <= zhi)
+        loc = np.where(mB)[0]
+        if loc.size < 10:
+            raise RuntimeError(f"Null mock: not enough SNe in target bin #{ibin+1} ({zlo}-{zhi}).")
+
+        if use_cov:
+            idxB = idxU[loc]
+            CB = cov_full[np.ix_(idxB, idxB)].copy()
+            if args.sigint > 0:
+                CB[np.diag_indices_from(CB)] += args.sigint**2
+            LB = whiten_from_cov(CB)
+        else:
+            LB = LU[loc]
+
+        # TEX-only model to match A_tex_fit: X = [1, proj_tex]
+        Xtex = np.column_stack([np.ones(loc.size), proj_tex_U[loc]])
+        bin_pre[ibin] = (loc, LB, Xtex)
+
+    # --- Observed amplitudes (prefer keys that exist in your pipeline) ---
+    def _get_obs_A(d):
+        if "A_tex" in d:
+            return float(d["A_tex"])
+        if "A_tex_fit" in d:
+            return float(d["A_tex_fit"])
+        raise RuntimeError("Null mock: zbin_results missing A_tex (or A_tex_fit).")
+
+    obs_map_A = {(float(d["zlo"]), float(d["zhi"])): _get_obs_A(d) for d in zbin_results}
+
+    zlo2, zhi2 = zb[i_peak]
+    zlo3, zhi3 = zb[i_outer]
+    if (zlo2, zhi2) not in obs_map_A or (zlo3, zhi3) not in obs_map_A:
+        raise RuntimeError("Null mock: missing observed A_tex for bin2/bin3 in zbin_results.")
+
+    A2_obs = float(obs_map_A[(zlo2, zhi2)])  # bin 2 observed amplitude (positive in your table)
+    # A3_obs not used for thresholding (we use a fixed extinction threshold)
+
+    # --- Fixed, non-tuned thresholds for morphology ---
+    thresh_peak  = 0.10   # generic "meaningful" peak (not tuned to the exact observed value)
+    thresh_outer = 0.01   # extinction threshold (outer bin consistent with ~0)
+
+    # --- Mock loop ---
+    A2_m = np.zeros(n_mocks, float)
+    A3_m = np.zeros(n_mocks, float)
+
+    for i in range(n_mocks):
+        g = rng.standard_normal(idxU.size)
+        dmuU_mock = (LU @ g) if use_cov else (LU * g)
+
+        # Bin 2
+        loc2, LB2, X2 = bin_pre[i_peak]
+        beta2, _ = gls_fit_and_chi2(LB2, X2, dmuU_mock[loc2])
+        A2 = float(beta2[1])  # signed
+
+        # Bin 3
+        loc3, LB3, X3 = bin_pre[i_outer]
+        beta3, _ = gls_fit_and_chi2(LB3, X3, dmuU_mock[loc3])
+        A3 = float(beta3[1])  # signed
+
+        A2_m[i] = A2
+        A3_m[i] = A3
+
+    # --- Empirical rates ---
+    # How often noise produces a bin-2 peak >= observed (signed, so negative peaks don't count)
+    p_peak = float(np.mean(A2_m >= A2_obs))
+
+    shell_mask = (
+        (A2_m >= max(A2_obs, thresh_peak)) &
+        (A2_m > 0.0) &
+        (np.abs(A3_m) <= thresh_outer)
+    )
+    n_shell = int(np.sum(shell_mask))
+    p_shell = float(n_shell / float(n_mocks))
+
+    print("\n=== Null Mock Tomography (Gaussian noise on real footprint; bins 2&3 only) ===")
+    print(f"N_mocks={n_mocks} seed={seed} use_cov={use_cov}")
+    print(f"zbins={zbins_spec}")
+    print(f"Using bins: peak=bin#{i_peak+1} ({zlo2:.3f}-{zhi2:.3f}), outer=bin#{i_outer+1} ({zlo3:.3f}-{zhi3:.3f})")
+    print(f"Observed: A2_obs={A2_obs:.6f}")
+    print(f"Criteria: A2>=max(A2_obs,{thresh_peak}) & A2>0 & |A3|<={thresh_outer}")
+    print(f"Counts: peak>=obs: {int(np.sum(A2_m >= A2_obs))}/{n_mocks}   shell: {n_shell}/{n_mocks}")
+    print(f"Empirical: p(peak>=obs)={p_peak:.3e}  p(shell)={p_shell:.3e}")
+    if n_shell == 0:
+        print(f"Note: with 0 hits, a simple upper bound is p_shell < {1.0/n_mocks:.3e} (at 1/N resolution).")
+
 
 # ---------- main ----------
 def main():
@@ -1916,12 +2272,10 @@ def main():
 
     ap.add_argument("--make_pillar_plots", action="store_true", help="Generate 4-panel TEX/KIN cosmology figure for chapter 6.")
     ap.add_argument("--make_h0_residuals", action="store_true", help="Generate standalone sky map of Hubble residuals")
-
     
-    ap.add_argument("--fix_tex_axis", default="", help="Fix texture dipole axis in galactic deg: 'l,b' (e.g. '135.54,5.99'). If set, no axis search; fit amplitude only.")
+    ap.add_argument("--fix_tex_axis", default="", help="Fix tex dipole axis in galactic deg: 'l,b' (e.g. '135.54,5.99'). If set, no axis search; fit amplitude only.")
     ap.add_argument("--fix_kin_axis", default="", help="Fix kinematic (1/z) dipole axis in galactic deg: 'l,b'. If set, no axis search; fit v_bulk only.")
     ap.add_argument("--zbins_global", action="store_true", help="With --zbins and fixed axes: fit global parameters (mono / tex / kin / mix) on all selected SNe, then report per-bin χ² contributions and Δχ² splits.")
-
 
     ap.add_argument("--zbins", default="", help="Comma list of zmin-zmax bins (e.g. '0-0.03,0.03-0.06,0.06-0.10,0.10-0.15'); runs bins table then exits.")
 
@@ -1956,39 +2310,6 @@ def main():
     ap.add_argument("--zmin", type=float, default=0.0, help="Lower redshift cut (inclusive).")
 
     ap.add_argument("--scan", default="", help="Comma list of zmax values; runs scan table then exits.")
-    ap.add_argument("--jackknife", action="store_true", help="Leave-one-survey-out using IDSURVEY (or --surveycol).")
-    # Robustness / diagnostics (optional)
-    ap.add_argument("--influence", action="store_true",
-                    help="Run influence diagnostics (whitened leverage + Cook's distance, plus drop-one refits).")
-    ap.add_argument("--influence_mode", default="mix", choices=["mono","tex","kin","mix"],
-                    help="Model used for influence diagnostics. Default: mix.")
-    ap.add_argument("--influence_top", type=int, default=20,
-                    help="Number of top influential points to print. Default: 20.")
-    ap.add_argument("--influence_dropone", type=int, default=0,
-                    help="If >0, perform drop-one refits for the top N CookD points. Default: 0.")
-    ap.add_argument("--jackknife_dir", type=int, default=0,
-                    help="Directional jackknife: number of directions (e.g. 48 or 96). 0 disables.")
-    ap.add_argument("--jackknife_dir_mode", choices=["cap","hemisphere"], default="cap",
-                    help="Directional jackknife removal type. Default: cap.")
-    ap.add_argument("--jackknife_dir_theta", type=float, default=30.0,
-                    help="Cap radius in degrees (only for mode=cap). Default: 30.")
-    ap.add_argument("--jackknife_dir_compare", choices=["tex","kin","mix_tex","mix_kin"], default="tex",
-                    help="Which axis/Δχ² to track in directional jackknife. Default: tex.")
-    ap.add_argument("--jackknife_dir_csv", default="",
-                    help="Optional CSV output for directional jackknife results.")
-    ap.add_argument("--constN", default="",
-                    help="Constant-N test: comma-separated zmin list (e.g. '0,0.003,0.005,0.01'). Empty disables.")
-    ap.add_argument("--constN_draws", type=int, default=200,
-                    help="Constant-N Monte Carlo draws per zmin (diag-only). Default: 200.")
-    ap.add_argument("--constN_N0", type=int, default=0,
-                    help="Constant-N common size. 0 uses min size across zmin list.")
-    ap.add_argument("--constN_model", choices=["tex","kin","mix"], default="tex",
-                    help="Model used in constant-N test. Default: tex.")
-    ap.add_argument("--constN_use_cov", action="store_true",
-                    help="Use full covariance in constant-N test (slower).")
-    ap.add_argument("--constN_csv", default="",
-                    help="Optional CSV output for constant-N summary table.")
-
     ap.add_argument("--permute", type=int, default=0, help="N permutations (shuffle residuals on fixed positions) for empirical pval.")
 
     ap.add_argument("--zcol", default="")
@@ -2005,6 +2326,31 @@ def main():
     ap.add_argument("--h0n", type=int, default=2001)
 
     ap.add_argument("--seed", type=int, default=0)
+
+    # Robustness / diagnostics
+    
+    ap.add_argument("--influence", action="store_true", help="Run influence diagnostics (whitened leverage + Cook's distance, plus drop-one refits).")
+    ap.add_argument("--influence_mode", default="mix", choices=["mono","tex","kin","mix"], help="Model used for influence diagnostics. Default: mix.")
+    ap.add_argument("--influence_top", type=int, default=20, help="Number of top influential points to print. Default: 20.")
+    ap.add_argument("--influence_dropone", type=int, default=0, help="If >0, perform drop-one refits for the top N CookD points. Default: 0.")
+    
+    ap.add_argument("--jackknife", action="store_true", help="Leave-one-survey-out using IDSURVEY (or --surveycol).")
+    ap.add_argument("--jackknife_dir", type=int, default=0, help="Directional jackknife: number of directions (e.g. 48 or 96). 0 disables.")
+    ap.add_argument("--jackknife_dir_mode", choices=["cap","hemisphere"], default="cap",  help="Directional jackknife removal type. Default: cap.")
+    ap.add_argument("--jackknife_dir_theta", type=float, default=30.0, help="Cap radius in degrees (only for mode=cap). Default: 30.")
+    ap.add_argument("--jackknife_dir_compare", choices=["tex","kin","mix_tex","mix_kin"], default="tex", help="Which axis/Δχ² to track in directional jackknife. Default: tex.")
+    ap.add_argument("--jackknife_dir_csv", default="",  help="Optional CSV output for directional jackknife results.")
+    
+    ap.add_argument("--constN", default="", help="Constant-N test: comma-separated zmin list (e.g. '0,0.003,0.005,0.01'). Empty disables.")
+    ap.add_argument("--constN_draws", type=int, default=200, help="Constant-N Monte Carlo draws per zmin (diag-only). Default: 200.")
+    ap.add_argument("--constN_N0", type=int, default=0, help="Constant-N common size. 0 uses min size across zmin list.")
+    ap.add_argument("--constN_model", choices=["tex","kin","mix"], default="tex", help="Model used in constant-N test. Default: tex.")
+    ap.add_argument("--constN_use_cov", action="store_true", help="Use full covariance in constant-N test (slower).")
+    ap.add_argument("--constN_csv", default="", help="Optional CSV output for constant-N summary table.")
+    
+    ap.add_argument("--null_mock_tomo", action="store_true", help="Run null mock tomography test (noise injection) to check for spurious shell signals.")
+    # ap.add_argument("--null_mock_tomo_n", type=int, default=1000, help="Number of Gaussian realizations for --null_mock_tomo (default: 1000).")
+    ap.add_argument("--scan_zmin_h0", default="", help="Comma-separated zmin values to scan for effective H0 impact (e.g. '0,0.01,0.02,0.03,0.04').")
 
     args = ap.parse_args()
 
@@ -2059,26 +2405,6 @@ def main():
         if cov_full.shape[0] != len(tab):
                     raise RuntimeError(f"FATAL: Covariance size ({cov_full.shape[0]}) does not match Data table length ({len(tab)}). Check inputs.")
         
-    # -------- scan mode --------
-    def parse_bins(s):
-        # "0-0.03,0.03-0.06" -> [(0,0.03),(0.03,0.06)]
-        if not s:
-            return []
-        out = []
-        for part in s.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            if "-" in part:
-                a, b = part.split("-", 1)
-            elif ":" in part:
-                a, b = part.split(":", 1)
-            else:
-                raise RuntimeError("Bad --zbins format. Use e.g. '0-0.03,0.03-0.06'")
-            lo = float(a.strip()); hi = float(b.strip())
-            out.append((lo, hi))
-        return out
-
     def gal_unitvec_from_lb(l_deg, b_deg):
         l = np.deg2rad(l_deg); b = np.deg2rad(b_deg)
         cb = np.cos(b)
@@ -2105,6 +2431,145 @@ def main():
                   f"{r.get('l_kin', float('nan')):7.2f} {r.get('b_kin', float('nan')):7.2f}")
         return
 
+    if args.scan_zmin_h0:
+        try:
+            zmins = [float(x) for x in args.scan_zmin_h0.split(",")]
+        except:
+            zmins = [0.0, 0.005, 0.010, 0.015, 0.020, 0.025, 0.030, 0.035, 0.040]
+        
+        zmins = sorted(list(set(zmins)))
+        ln10_over_5 = math.log(10.0) / 5.0
+        
+        print("\n=== Effective H0 Impact Scan (with Error Propagation) ===")
+        print("# Comparing Isotropic Monopole vs Directional Mix (KIN+TEX)")
+        print("# Sigma(H0) ~ H0_grid * (ln10/5) * Sigma(a0)")
+        print("-" * 130)
+        header = (f"{'zmin':<8} {'N':<6} "
+                  f"{'H0_mono':<10} {'err':<8} "
+                  f"{'H0_mix':<10} {'err':<8} "
+                  f"{'Delta_H0':<10} {'sig_Delta':<10}")
+        print(header)
+        print("-" * 130)
+
+        rows_h0 = []
+
+        for zmin_cut in zmins:
+            # Local mask for this zmin threshold
+            m = base_mask & (z_all >= zmin_cut) & (z_all <= args.zmax)
+            idx = np.where(m)[0]
+            
+            if len(idx) < 10:
+                continue
+
+            # Run full fit pipeline
+            r = fit_dipole(tab, idx, args, cov_full=cov_full)
+
+            h0_grid = r['H0']
+            
+            # Retrieve intercepts
+            a0_iso  = r['a0']
+            a0_mix  = r.get('a0_mix', float('nan')) # Safe retrieval
+            
+            # Retrieve intercept errors (from GLS covariance)
+            e_a0_iso = r.get('err_a0_mono', 0.0)
+            e_a0_mix = r.get('err_a0_mix', 0.0)
+            
+            # Calculate effective H0
+            h0_eff_mono = h0_grid * (1.0 - ln10_over_5 * a0_iso)
+            h0_eff_mix  = h0_grid * (1.0 - ln10_over_5 * a0_mix)
+            
+            # Error propagation to H0 units
+            # sig_H0 = H0_grid * (ln10/5) * sig_a0
+            sig_h0_mono = h0_grid * ln10_over_5 * e_a0_iso
+            sig_h0_mix  = h0_grid * ln10_over_5 * e_a0_mix
+            
+            # Difference and quadrature error (conservative)
+            delta = h0_eff_mix - h0_eff_mono
+            sig_delta = math.sqrt(sig_h0_mono**2 + sig_h0_mix**2)
+
+            print(f"{zmin_cut:<8.4f} {r['N']:<6d} "
+                  f"{h0_eff_mono:<10.3f} {sig_h0_mono:<8.3f} "
+                  f"{h0_eff_mix:<10.3f} {sig_h0_mix:<8.3f} "
+                  f"{delta:<+10.3f} {sig_delta:<10.3f}")
+            
+            # Save data for plotting
+            rows_h0.append((zmin_cut, r['N'], 
+                            h0_eff_mono, sig_h0_mono, 
+                            h0_eff_mix, sig_h0_mix,
+                            delta, sig_delta))
+
+        if rows_h0:
+            out_csv = "h0_impact_scan.csv"
+            with open(out_csv, "w") as f:
+                # Explicit CSV header
+                f.write("zmin,N,H0_mono,err_mono,H0_mix,err_mix,Delta_H0,err_Delta\n")
+                for row in rows_h0:
+                    # Clean float formatting
+                    line = ",".join(f"{x:.6f}" for x in row)
+                    f.write(line + "\n")
+            print(f"\n[INFO] Saved scan data to {out_csv}")
+        
+        return        
+        # zmins = parse_list(args.scan_zmin_h0)
+        # zmins = sorted(list(set(zmins)))
+        
+        # print("\n=== Effective H0 Impact Scan (vs zmin) ===")
+        # print("# Comparing Isotropic Monopole vs Directional Mix (KIN+TEX)")
+        # print("# Formula: H0_eff = H0_grid * (1 - (ln10/5)*a0)")
+        # print(f"# Fixed zmax = {args.zmax}")
+        # print("-" * 110) # Un peu plus large pour les erreurs
+        # print(f"{'zmin':<8} {'N':<6} {'H0_mono':<10} {'err':<8} {'H0_mix':<10} {'err':<8} {'Delta_H0':<10}")
+        # print("-" * 110)
+
+        # ln10_over_5 = math.log(10.0) / 5.0
+        # rows_h0 = []
+
+        # for zmin_cut in zmins:
+        #     m = base_mask & (z_all >= zmin_cut) & (z_all <= args.zmax)
+        #     idx = np.where(m)[0]
+            
+        #     if len(idx) < 10:
+        #         continue
+
+        #     r = fit_dipole(tab, idx, args, cov_full=cov_full)
+
+        #     h0_grid = r['H0']
+        #     a0_iso  = r['a0']
+        #     a0_mix  = r['a0_mix']
+            
+        #     # Récupération des erreurs (ajoutées à l'étape 1)
+        #     e_iso = r.get('err_a0_mono', 0.0)
+        #     e_mix = r.get('err_a0_mix', 0.0)
+            
+        #     # Calcul des H0 effectifs
+        #     h0_eff_mono = h0_grid * (1.0 - ln10_over_5 * a0_iso)
+        #     h0_eff_mix  = h0_grid * (1.0 - ln10_over_5 * a0_mix)
+            
+        #     # Propagation des erreurs
+        #     # sigma_H = H * (ln10/5) * sigma_a0
+        #     sig_h0_mono = h0_grid * ln10_over_5 * e_iso
+        #     sig_h0_mix  = h0_grid * ln10_over_5 * e_mix
+            
+        #     delta = h0_eff_mix - h0_eff_mono
+
+        #     print(f"{zmin_cut:<8.4f} {r['N']:<6d} "
+        #           f"{h0_eff_mono:<10.3f} {sig_h0_mono:<8.3f} "
+        #           f"{h0_eff_mix:<10.3f} {sig_h0_mix:<8.3f} "
+        #           f"{delta:<+10.3f}")
+            
+        #     # On sauvegarde aussi les erreurs dans le CSV
+        #     rows_h0.append((zmin_cut, r['N'], h0_eff_mono, sig_h0_mono, h0_eff_mix, sig_h0_mix))
+
+        # if rows_h0:
+        #     out_csv = "h0_impact_scan.csv"
+        #     with open(out_csv, "w") as f:
+        #         f.write("zmin,N,H0_mono,err_mono,H0_mix,err_mix\n")
+        #         for row in rows_h0:
+        #             f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
+        #     print(f"\n[INFO] Saved scan data to {out_csv}")
+        
+        # return
+    
     zbin_results = []
     zb = parse_bins(args.zbins)
     if zb:
@@ -2329,6 +2794,9 @@ def main():
                 f"Δχ²_tex={sum_fix_tex:.3f}  "
                 f"Δχ²_kin={sum_fix_kin:.3f}  Δχ²_mix={sum_fix_mix:.3f}"
             )
+            
+            if args.null_mock_tomo:
+                run_null_mock_tomography(tab, base_mask, args, cov_full, zbin_results)
 
         # Each bin fitted independently (axes may float unless --fix_*_axis)
         print("=== z bins (each bin fitted independently) ===")
@@ -2337,6 +2805,8 @@ def main():
             "dChi2_kin  v_bulk   l_kin   b_kin   dChi2(D|K)  p(D|K)   "
             "dChi2(K|D)  p(K|D)"
         )
+        
+        
         for (zlo, zhi) in zb:
             m = base_mask & (z_all > zlo) & (z_all <= zhi)
             idx = np.where(m)[0]
@@ -2387,6 +2857,12 @@ def main():
     idx0 = np.where(m)[0]
     r0 = fit_dipole(tab, idx0, args, cov_full=cov_full)
 
+    # ========= Mock  =========
+    if args.null_mock_tomo:
+            # Run the null test and exit
+            run_null_mock_tomography(tab, idx0, args, cov_full, n_mocks=1000)
+            return   
+         
     # ========= Standalone sky map of Hubble residuals =========
     if args.make_h0_residuals:
         # Basic columns
@@ -2406,36 +2882,78 @@ def main():
         l = (np.degrees(np.arctan2(n_gal[:, 1], n_gal[:, 0])) + 360.0) % 360.0
         b = np.degrees(np.arcsin(np.clip(n_gal[:, 2], -1.0, 1.0)))
 
-        # Wide figure (roughly double width)
-        fig, ax = plt.subplots(1, 1, figsize=(10.0, 5.0))
+        # Matplotlib Mollweide requires radians in range [-pi, pi] for longitude
+        l_rad = np.radians(l)
+        l_rad[l_rad > np.pi] -= 2 * np.pi  # Wrap 0..360 to -180..180
+
+        # Enforce astronomical convention (longitude increases to the left)
+        l_rad = -l_rad
+
+        b_rad = np.radians(b)
+
+        # Axis Locations (Convert to radians + wrap)
+        def to_mollweide_rad(l_deg, b_deg):
+            lr = np.radians(l_deg)
+            if lr > np.pi:
+                lr -= 2 * np.pi
+            # >>> FIX: same mirror for markers
+            lr = -lr
+            br = np.radians(b_deg)
+            return lr, br
+
+        # Colors matching Figure S2
+        c_tex = "#EE3333" # Red
+        c_kin = "#0000BB" # Blue
+        c_ref = 'black'
+
+        # Create Figure
+        fig, ax = plt.subplots(1, 1, figsize=(10.0, 6.0), subplot_kw={'projection': 'mollweide'})
 
         vmax = float(np.max(np.abs(dmu)))
         sc = ax.scatter(
-            l, b, c=dmu, s=20,
+            l_rad, b_rad, c=dmu, s=20,
             cmap="coolwarm", vmin=-vmax, vmax=+vmax,
-            alpha=0.8, edgecolors="none"
+            alpha=0.8, edgecolors="none", rasterized=True
         )
 
-        ax.set_xlim(0.0, 360.0)
-        ax.set_ylim(-90.0, 90.0)
-        ax.set_xlabel("Galactic longitude $\\ell$ [deg]")
-        ax.set_ylabel("Galactic latitude $b$ [deg]")
-        ax.set_title("Hubble residuals $\\Delta\\mu$ on the sky")
+        ax.grid(True, linestyle=':', alpha=0.6)
+        ax.set_title("Hubble residuals $\\Delta\\mu$ on the sky (Galactic)")
+        
+        # Correct Matplotlib graduations (astro labels)
+        tick_pos_deg = [-150, -120, -90, -60, -30, 0, 30, 60, 90, 120, 150]
+        tick_pos_rad = np.deg2rad(tick_pos_deg)
+        astronomical_xticks = ['150°','120°','90°','60°','30°','0°','330°','300°','270°','240°','210°']
 
-        # Overlay TEX axis, KIN axis, and anti–Great Attractor
-        ax.scatter(r0["l"], r0["b"], marker="*", s=120, color="k", label="TEX axis")
+        ax.set_xticks(tick_pos_rad)
+        ax.set_xticklabels(astronomical_xticks)
+
+        # Overlay TEX axis
+        if math.isfinite(r0["l"]):
+            lt, bt = to_mollweide_rad(r0["l"], r0["b"])
+            ax.scatter(lt, bt, marker="*", s=200, facecolor=c_tex, edgecolor='k', 
+                       linewidth=1.2, zorder=10, label="TEX axis (Baseline T1)")
+
+        # Overlay KIN axis
         if "l_kin" in r0 and math.isfinite(r0["l_kin"]):
-            ax.scatter(r0["l_kin"], r0["b_kin"], marker="D", s=80, color="k", label="KIN axis")
-        ax.scatter(AGA_L, AGA_B, marker="x", s=80, color="k", label="Anti-GA")
-        ax.legend(loc="lower left", fontsize=8)
+            lk, bk = to_mollweide_rad(r0["l_kin"], r0["b_kin"])
+            ax.scatter(lk, bk, marker="D", s=100, facecolor=c_kin, edgecolor='k', 
+                       linewidth=1.2, zorder=10, label="KIN axis (Baseline T1)")
 
-        cbar = fig.colorbar(sc, ax=ax, fraction=0.046, pad=0.04)
+        # Overlay Anti-GA
+        l_aga, b_aga = to_mollweide_rad(AGA_L, AGA_B)
+        ax.scatter(l_aga, b_aga, marker="x", s=100, color=c_ref, 
+                   linewidth=2, zorder=9, label="Anti-Norma Direction")
+
+        ax.legend(loc="lower right", fontsize=9, framealpha=0.9)
+
+        cbar = fig.colorbar(sc, ax=ax, orientation='horizontal', fraction=0.046, pad=0.04, shrink=0.6)
         cbar.set_label("$\\Delta\\mu$ [mag]")
 
         fig.tight_layout()
-        fig.savefig("fig_h0_residuals_sky.png", dpi=200)
+        fig.savefig("fig_1a_residuals_sky_mollweide.png", dpi=300)
         plt.close(fig)
-        print("[INFO] Saved figure 'fig_h0_residuals_sky.png'")
+        print("[INFO] Saved figure 'fig_1a_residuals_sky_mollweide.png' (Mollweide)")
+
 
     # ========= Pillar plots: 4 histograms over z-bins =========
     if args.make_pillar_plots:
@@ -2564,9 +3082,9 @@ def main():
     print(f"χ²_iso  (H0-only FRW, isotropic): {r0['chi2_iso']:.2f}")
     print(f"χ²_mono (a0-only, mean residual): {r0['chi2_mono']:.2f}")
 
-    # ========= TEX: constant-in-z dipole (texture-like) =========
+    # ========= TEX: constant-in-z dipole (tex-like) =========
     dof_tex = r0.get('dof_tex', 3)
-    print("\n--- TEX: constant-in-z dipole on μ (texture-like mode) ---")
+    print("\n--- TEX: constant-in-z dipole on μ (tex-like mode) ---")
     print(f"χ²_TEX (a0 + A_tex·n, const amp): {r0['chi2_dip']:.2f}")
     print(f"Δχ²_TEX (MONO → TEX, {dof_tex} dof): {r0['dchi2_3']:.2f}")
     print(f"p-value_TEX (χ², {dof_tex} dof): {r0['p3']:.3e}")
