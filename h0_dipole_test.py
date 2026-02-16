@@ -17,8 +17,7 @@ Usage:
 Author:  Michaël Vaillant
 Affil:   Meta-Connexions, Toulouse, France
 License: MIT
-Version: 6.5.0
-DOI:     10.5281/zenodo.18603301
+Version: 6.6.0
 Paper:   "Dipole mapping of the local Hubble expansion", Vaillant (2026)
 
 Dependencies:
@@ -339,7 +338,10 @@ def rand_rotation_matrix(rng):
 
 
 def fit_dipole(tab, idx, args, cov_full=None):
-
+    """
+    Performs GLS fits for Monopole, Dipole (TEX/KIN), and Mixed models.
+    Supports survey marginalization (Test 1) and fixed-axis modes.
+    """
     global RA_COL, DEC_COL, MU_COL, MUERR_COL, Z_COL
     names = list(tab.dtype.names)
 
@@ -359,6 +361,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
     if bad:
         raise RuntimeError("Missing required columns: " + ", ".join(bad) + "\nAvailable:\n" + ", ".join(names))
 
+    # --- Load Data for subset ---
     ra  = np.array(tab[ra_name],  float)[idx]
     dec = np.array(tab[dec_name], float)[idx]
     mu  = np.array(tab[mu_name],  float)[idx]
@@ -366,19 +369,17 @@ def fit_dipole(tab, idx, args, cov_full=None):
     muerr = np.array(tab[mue_name], float)[idx]
     muerr = np.maximum(muerr, 1e-6)
 
-    # --- whitening L (diag or full cov) ---
+    # --- Whitening L (Diagonal or Full Covariance) ---
     if (cov_full is not None) and args.use_cov:
         C = cov_full[np.ix_(idx, idx)].copy()
         if args.sigint > 0:
             C[np.diag_indices_from(C)] += args.sigint**2
         if getattr(args, "sigv", 0.0) > 0:
-            # Approximate peculiar-velocity contribution to distance-modulus error (low-z):
-            # sigma_mu ≈ (5/ln10) * (sigv / (c*z))
+            # Peculiar velocity error: sigma_mu approx (5/ln10) * (sigv / c*z)
             z_safe = np.maximum(z, 1e-6)
             sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
             C[np.diag_indices_from(C)] += sigmu_v**2
         L = whiten_from_cov(C)
-        # NOTE: do NOT add muerr diag again here (assume cov already includes it)
     else:
         sig2 = muerr*muerr + args.sigint*args.sigint
         if getattr(args, "sigv", 0.0) > 0:
@@ -387,42 +388,74 @@ def fit_dipole(tab, idx, args, cov_full=None):
             sig2 = sig2 + sigmu_v*sigmu_v
         L = np.sqrt(sig2)   # (N,) std vector
 
-    # --- H0 grid search (isotropic) ---
-    H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
-    best = (1e300, None)
-    for H0 in H0_grid:
-        mu_th = hubble_mu_model(z, H0, q0=args.q0)
-        r = (mu - mu_th).astype(float)
-        chi2 = chi2_only(L, r)
-        if chi2 < best[0]:
-            best = (chi2, H0)
+    # --- H0 Grid Search (Isotropic Baseline) ---
+    # H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
+    # best = (1e300, None)
+    # for H0 in H0_grid:
+    #     mu_th = hubble_mu_model(z, H0, q0=args.q0)
+    #     r = (mu - mu_th).astype(float)
+    #     chi2 = chi2_only(L, r)
+    #     if chi2 < best[0]:
+    #         best = (chi2, H0)
 
-    chi2_iso, H0_best = best
+    # chi2_iso, H0_best = best
+    # mu_th = hubble_mu_model(z, H0_best, q0=args.q0)
+    # dmu = (mu - mu_th).astype(float)
+    # --- H0 Optimization (Analytical; replaces slow grid search) ---
+    # In hubble_mu_model, H0 enters as an additive constant in mu_th:
+    # mu_th(z, H0) = mu_th(z, H0_ref) - 5*log10(H0/H0_ref).
+    # Therefore, minimizing chi2 over H0 is equivalent to solving for the best
+    # constant shift d that minimizes || L^{-1} (r_ref - d*1) ||^2.
+
+    H0_ref = 70.0 # an arbitrary reference H0 (e.g. 70) to compute initial residuals
+    mu_th_ref = hubble_mu_model(z, H0_ref, q0=args.q0)
+    r_ref = (mu - mu_th_ref).astype(float)
+
+    ones = np.ones_like(r_ref)
+
+    y_w = solve_lower(L, r_ref)
+    ones_w = solve_lower(L, ones)
+
+    denom = float(np.dot(ones_w, ones_w))
+    if denom <= 0.0 or (not math.isfinite(denom)):
+        # Fallback (should not happen unless L is pathological)
+        H0_best = H0_ref
+    else:
+        d = float(np.dot(ones_w, y_w)) / denom  # best-fit constant shift in mu_th
+        H0_best = H0_ref * (10.0 ** (-d / 5.0))
+
+    # Keep previous behavior: enforce the [h0min, h0max] search bounds
+    if H0_best < args.h0min:
+        H0_best = args.h0min
+    elif H0_best > args.h0max:
+        H0_best = args.h0max
+
     mu_th = hubble_mu_model(z, H0_best, q0=args.q0)
     dmu = (mu - mu_th).astype(float)
 
-    # --- unit vectors / helpers ---
+    # Isotropic chi2 at the optimized H0
+    chi2_iso = chi2_only(L, dmu)
+
+    # --- Geometry Vectors ---
     n = unitvec_from_radec(ra, dec)      # (N,3) equatorial unit vectors
     zinv = 1.0 / np.maximum(z, 1e-6)
 
-    # Galactic latitude helpers (for MW templates)
+    # Galactic latitude helpers
     n_gal = n @ EQ2GAL.T
     sinb = n_gal[:, 2]
 
-    # --- fixed axes (galactic input -> equatorial vector) ---
+    # --- Fixed Axes Projections ---
     tex_fix = _parse_lb(getattr(args, "fix_tex_axis", ""))   # (l,b) or None
     kin_fix = _parse_lb(getattr(args, "fix_kin_axis", ""))   # (l,b) or None
 
-    deq_tex = None
-    deq_kin = None
     proj_tex = None
     proj_kin = None
 
     if tex_fix is not None:
         l0, b0 = tex_fix
-        dgal = _uvec_from_lb(l0, b0)         # (3,)
+        dgal = _uvec_from_lb(l0, b0)
         deq_tex = (EQ2GAL.T @ dgal).astype(float)
-        proj_tex = (n @ deq_tex).astype(float)  # (N,)
+        proj_tex = (n @ deq_tex).astype(float)
 
     if kin_fix is not None:
         l0, b0 = kin_fix
@@ -430,301 +463,264 @@ def fit_dipole(tab, idx, args, cov_full=None):
         deq_kin = (EQ2GAL.T @ dgal).astype(float)
         proj_kin = (n @ deq_kin).astype(float)
 
-    # --- design matrices ---
-    X0 = np.ones((len(dmu), 1), float)  # monopole only
+    # =========================================================================
+    # TEST 1: Survey Marginalization (Heterogeneity Check)
+    # =========================================================================
+    survey_cols = []
+    if getattr(args, "marginalize_surveys", False):
+        if surv_name and (surv_name in names):
+            # Extract surveys for the current subset
+            s_ids = np.array(tab[surv_name])[idx]
+            unique_ids = np.unique(s_ids)
+            
+            # Identify reference survey (most frequent) to avoid collinearity
+            counts = [np.sum(s_ids == uid) for uid in unique_ids]
+            ref_survey = unique_ids[np.argmax(counts)]
+            
+            # Create dummy columns for others
+            other_surveys = [uid for uid in unique_ids if uid != ref_survey]
+            for uid in other_surveys:
+                col = (s_ids == uid).astype(float)
+                survey_cols.append(col)
+                
+            # Optional: Verbose info
+            # if len(survey_cols) > 0:
+            #     print(f" [Info] Marginalizing over {len(survey_cols)} surveys (Ref: {ref_survey})")
+        else:
+            print("[WARN] --marginalize_surveys requested but no survey column found.")
 
-    # Tex : either full D·n (3 params) or fixed-axis A*(d·n) (1 param)
+    # Determine index where physical dipole parameters start
+    # Index 0 is always global monopole.
+    # Indices 1 to N_surv are survey offsets.
+    # So physical parameters start at:
+    idx_start = 1 + len(survey_cols)
+
+    # --- Helper to build Design Matrix ---
+    def build_design(phys_cols):
+        # Always: [Global_Mono, Survey_Dummies..., Physical_Model...]
+        base = [np.ones(len(dmu))] + survey_cols
+        if phys_cols:
+            base += phys_cols
+        return np.column_stack(base)
+
+    # --- Build Matrices ---
+    # 1. Monopole (+ Surveys)
+    X0 = build_design([]) 
+
+    # 2. TEX
     if tex_fix is None:
-        X_tex = np.column_stack([np.ones(len(dmu)), n[:,0], n[:,1], n[:,2]])    # a0 + D·n
+        X_tex = build_design([n[:,0], n[:,1], n[:,2]])
     else:
-        X_tex = np.column_stack([np.ones(len(dmu)), proj_tex])                 # a0 + A*(d·n)
+        X_tex = build_design([proj_tex])
 
-    # kinematic: either full (K·n)/z (3 params) or fixed-axis B*(d·n)/z (1 param)
+    # 3. KIN
     if kin_fix is None:
-        X_kin = np.column_stack([np.ones(len(dmu)), n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])  # a0 + (K·n)/z
+        X_kin = build_design([n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])
     else:
-        X_kin = np.column_stack([np.ones(len(dmu)), proj_kin*zinv])                              # a0 + B*(d·n)/z
+        X_kin = build_design([proj_kin*zinv])
 
-    # mix: concatenate the chosen tex + chosen kinematic blocks
-    mix_cols = [np.ones(len(dmu))]
-    if tex_fix is None:
-        mix_cols += [n[:,0], n[:,1], n[:,2]]
-    else:
-        mix_cols += [proj_tex]
-    if kin_fix is None:
-        mix_cols += [n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv]
-    else:
-        mix_cols += [proj_kin*zinv]
-    X_mix = np.column_stack(mix_cols)
+    # 4. MIX
+    mix_c = []
+    if tex_fix is None: mix_c += [n[:,0], n[:,1], n[:,2]]
+    else: mix_c += [proj_tex]
+    
+    if kin_fix is None: mix_c += [n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv]
+    else: mix_c += [proj_kin*zinv]
+    
+    X_mix = build_design(mix_c)
 
-    # --- fits ---
+    # --- Perform GLS Fits ---
     beta0,   chi2_mono = gls_fit_and_chi2(L, X0,    dmu)
     beta_tx, chi2_tex  = gls_fit_and_chi2(L, X_tex, dmu)
     beta_kn, chi2_kin  = gls_fit_and_chi2(L, X_kin, dmu)
     beta_mx, chi2_mix  = gls_fit_and_chi2(L, X_mix, dmu)
 
+    # Intercepts (Global Monopole is always at index 0)
     a0 = float(beta0[0])
+    a0_mix = float(beta_mx[0])
 
-    # Keep legacy naming: "dip" = tex dipole component
-    chi2_dip = chi2_tex
-    dchi2_4dof = chi2_iso  - chi2_tex
-    dchi2_tex  = chi2_mono - chi2_tex
-
+    # Delta Chi2
+    dchi2_tex = chi2_mono - chi2_tex
     dchi2_kin = chi2_mono - chi2_kin
     dchi2_mix = chi2_mono - chi2_mix
 
-    # incremental partition diagnostics (these χ² diffs are always valid; ddl depends on axis-fixing)
+    # Nested Comparisons
+    dchi2_4dof = chi2_iso - chi2_tex # H0-only -> TEX
     dchi2_add_kin_given_tex = chi2_tex - chi2_mix
     dchi2_add_tex_given_kin = chi2_kin - chi2_mix
+    
+    # --- Degrees of Freedom ---
+    dof_tex = 1 if (tex_fix is not None) else 3
+    dof_kin = 1 if (kin_fix is not None) else 3
+    dof_mix = dof_tex + dof_kin
+    
+    # --- P-values & Sigmas (Using chi2_sf dispatcher) ---
+    p_tex = chi2_sf(dchi2_tex, dof_tex)
+    z1_tex = norm_isf(p_tex) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
+    z2_tex = norm_isf(p_tex/2.0) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
 
-    # --- tex dipole params / vectors ---
+    p_kin = chi2_sf(dchi2_kin, dof_kin)
+    z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
+    z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
+
+    p_mix = chi2_sf(dchi2_mix, dof_mix)
+    z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
+    z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
+
+    # Conditional Adds
+    p_add_kin_given_tex = chi2_sf(dchi2_add_kin_given_tex, dof_kin)
+    p_add_tex_given_kin = chi2_sf(dchi2_add_tex_given_kin, dof_tex)
+
+    # 4-dof comparison (H0 only -> TEX)
+    p4 = chi2_sf_df4(dchi2_4dof)
+    z1_4 = norm_isf(p4) if (0.0 < p4 < 1.0) else float("nan")
+    z2_4 = norm_isf(p4/2.0) if (0.0 < p4 < 1.0) else float("nan")
+
+    # =========================================================================
+    # Extract Dipole Parameters (Using idx_start to handle survey cols)
+    # =========================================================================
+    
+    # --- TEX Parameters ---
     if tex_fix is None:
-        D_vec = beta_tx[1:4].astype(float)
+        D_vec = beta_tx[idx_start : idx_start+3].astype(float)
         A_mu = float(np.linalg.norm(D_vec))
         if A_mu > 0:
-            Dx, Dy, Dz = D_vec
-            ra_hat  = (math.degrees(math.atan2(Dy, Dx)) + 360.0) % 360.0
-            dec_hat = math.degrees(math.asin(Dz / A_mu))
+            ra_hat  = (math.degrees(math.atan2(D_vec[1], D_vec[0])) + 360.0) % 360.0
+            dec_hat = math.degrees(math.asin(D_vec[2] / A_mu))
             l_hat, b_hat = radec_to_gal_l_b(ra_hat, dec_hat)
         else:
             ra_hat = dec_hat = l_hat = b_hat = float("nan")
     else:
-        amp = float(beta_tx[1])      # signed amplitude along fixed axis
-        # enforce positive amplitude by flipping axis if needed (pure convention)
+        amp = float(beta_tx[idx_start])
+        # Force positive amplitude convention
+        axis_tex = deq_tex.copy()
+        amp = float(beta_tx[idx_start])
         if amp < 0:
             amp = -amp
-            deq_tex = -deq_tex
-        D_vec = (amp * deq_tex).astype(float)
+            axis_tex = -axis_tex
+        D_vec = amp * axis_tex
         A_mu  = float(amp)
-        # direction from deq_tex
-        x, y, zc = float(deq_tex[0]), float(deq_tex[1]), float(deq_tex[2])
-        ra_hat  = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-        dec_hat = math.degrees(math.asin(max(-1.0, min(1.0, zc))))
+        # Direction
+        ra_hat  = (math.degrees(math.atan2(deq_tex[1], deq_tex[0])) + 360.0) % 360.0
+        dec_hat = math.degrees(math.asin(max(-1.0, min(1.0, deq_tex[2]))))
         l_hat, b_hat = radec_to_gal_l_b(ra_hat, dec_hat)
 
-    frac = (math.log(10.0)/5.0) * A_mu  # |δH0/H0|
+    frac = (math.log(10.0)/5.0) * A_mu
 
-    # --- kinematic dipole params / vectors ---
+    # --- KIN Parameters ---
     if kin_fix is None:
-        K_vec = beta_kn[1:4].astype(float)
+        K_vec = beta_kn[idx_start : idx_start+3].astype(float)
         A_mu_kin = float(np.linalg.norm(K_vec))
         if A_mu_kin > 0:
-            Kx, Ky, Kz = K_vec
-            ra_k  = (math.degrees(math.atan2(Ky, Kx)) + 360.0) % 360.0
-            dec_k = math.degrees(math.asin(Kz / A_mu_kin))
+            ra_k  = (math.degrees(math.atan2(K_vec[1], K_vec[0])) + 360.0) % 360.0
+            dec_k = math.degrees(math.asin(K_vec[2] / A_mu_kin))
             l_k, b_k = radec_to_gal_l_b(ra_k, dec_k)
         else:
             ra_k = dec_k = l_k = b_k = float("nan")
     else:
-        amp = float(beta_kn[1])  # signed
-        if amp < 0:
-            amp = -amp
-            deq_kin = -deq_kin
-        K_vec = (amp * deq_kin).astype(float)
+        amp = float(beta_kn[idx_start])
+        # Force positive amplitude convention
+        K_vec = (amp * deq_kin).astype(float)       
         A_mu_kin = float(amp)
-        x, y, zc = float(deq_kin[0]), float(deq_kin[1]), float(deq_kin[2])
-        ra_k  = (math.degrees(math.atan2(y, x)) + 360.0) % 360.0
-        dec_k = math.degrees(math.asin(max(-1.0, min(1.0, zc))))
+        
+        ra_k  = (math.degrees(math.atan2(deq_kin[1], deq_kin[0])) + 360.0) % 360.0
+        dec_k = math.degrees(math.asin(max(-1.0, min(1.0, deq_kin[2]))))
         l_k, b_k = radec_to_gal_l_b(ra_k, dec_k)
 
     v_bulk = (math.log(10.0)/5.0) * C_LIGHT * A_mu_kin
 
-    # --- mixed params (extract best-fit vectors in equatorial coords) ---
-    # Note: columns depend on which axes are fixed; we rebuild by reading beta_mx accordingly.
-    # beta_mx = [a0, (tex block...), (kin block...)]
-    j = 1
+    # --- MIX Parameters (need to track index carefully) ---
+    j = idx_start
+    # Extract TEX part from MIX
     if tex_fix is None:
-        Dm = beta_mx[j:j+3].astype(float); j += 3
+        Dm = beta_mx[j : j+3].astype(float); j += 3
     else:
         amp = float(beta_mx[j]); j += 1
-        if amp < 0:
-            amp = -amp
-            deq_tex_m = -deq_tex
-        else:
-            deq_tex_m = deq_tex
-        Dm = (amp * deq_tex_m).astype(float)
+        # Reconstruct vector (handle sign)
+        # Note: deq_tex here is the original fixed axis
+        # if amp < 0: Dm = (-amp * -deq_tex) # logic consistent with above
+        # else: Dm = (amp * deq_tex)
+        Dm = (amp * deq_tex).astype(float) # Simple vector math
 
+    # Extract KIN part from MIX
     if kin_fix is None:
-        Km = beta_mx[j:j+3].astype(float); j += 3
+        Km = beta_mx[j : j+3].astype(float); j += 3
     else:
         amp = float(beta_mx[j]); j += 1
-        if amp < 0:
-            amp = -amp
-            deq_kin_m = -deq_kin
-        else:
-            deq_kin_m = deq_kin
-        Km = (amp * deq_kin_m).astype(float)
+        Km = (abs(amp) * (deq_kin if amp>=0 else -deq_kin)).astype(float)
 
     A_mu_mix_tex = float(np.linalg.norm(Dm))
     A_mu_mix_kin = float(np.linalg.norm(Km))
     v_bulk_mix = (math.log(10.0)/5.0) * C_LIGHT * A_mu_mix_kin
 
+    # Mix Directions
     if A_mu_mix_tex > 0:
-        Dx, Dy, Dz = Dm
-        ra_mD  = (math.degrees(math.atan2(Dy, Dx)) + 360.0) % 360.0
-        dec_mD = math.degrees(math.asin(Dz / A_mu_mix_tex))
+        ra_mD  = (math.degrees(math.atan2(Dm[1], Dm[0])) + 360.0) % 360.0
+        dec_mD = math.degrees(math.asin(Dm[2] / A_mu_mix_tex))
         l_mD, b_mD = radec_to_gal_l_b(ra_mD, dec_mD)
     else:
         ra_mD = dec_mD = l_mD = b_mD = float("nan")
 
     if A_mu_mix_kin > 0:
-        Kx, Ky, Kz = Km
-        ra_mK  = (math.degrees(math.atan2(Ky, Kx)) + 360.0) % 360.0
-        dec_mK = math.degrees(math.asin(Kz / A_mu_mix_kin))
+        ra_mK  = (math.degrees(math.atan2(Km[1], Km[0])) + 360.0) % 360.0
+        dec_mK = math.degrees(math.asin(Km[2] / A_mu_mix_kin))
         l_mK, b_mK = radec_to_gal_l_b(ra_mK, dec_mK)
     else:
         ra_mK = dec_mK = l_mK = b_mK = float("nan")
 
-    # --- p-values: ddl depend on whether axes are fixed ---
-    dof_tex = 1 if (tex_fix is not None) else 3
-    dof_kin = 1 if (kin_fix is not None) else 3
+    # =========================================================================
+    # Error Calculation for Intercepts (a0)
+    # Needed for H0 impact plot with error bars
+    # =========================================================================
     
-    # "mix vs mono": add (tex block) + (kin block)
-    # df can be 2 (both fixed), 4 (one fixed, one free), or 6 (both free)
-    dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)
-
-    # --- P-values & Sigmas (Cleaned version) ---
-    
-    # TEX
-    p_tex = chi2_sf(dchi2_tex, dof_tex)
-    z1_tex = norm_isf(p_tex) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
-    z2_tex = norm_isf(p_tex/2.0) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
-
-    # KIN
-    p_kin = chi2_sf(dchi2_kin, dof_kin)
-    z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
-    z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
-
-    # MIX (df=2, 4, or 6)
-    p_mix = chi2_sf(dchi2_mix, dof_mix)
-    z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
-    z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
-
-    # Conditional adds (Nested models)
-    dof_add_kin = 1 if (kin_fix is not None) else 3
-    dof_add_tex = 1 if (tex_fix is not None) else 3
-
-    p_add_kin_given_tex = chi2_sf(dchi2_add_kin_given_tex, dof_add_kin)
-    p_add_tex_given_kin = chi2_sf(dchi2_add_tex_given_kin, dof_add_tex)
-    
-    # # --- p-values: ddl depend on whether axes are fixed ---
-    # dof_tex = 1 if (tex_fix is not None) else 3
-    # dof_kin = 1 if (kin_fix is not None) else 3
-    # # "mix vs mono": add (tex block) + (kin block)
-    # dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)
-
-    # if dof_tex == 1:
-    #     p_tex = chi2_sf_df1(dchi2_tex)
-    # else:
-    #     p_tex = chi2_sf_df3(dchi2_tex)
-
-    # if dof_kin == 1:
-    #     p_kin = chi2_sf_df1(dchi2_kin)
-    # else:
-    #     p_kin = chi2_sf_df3(dchi2_kin)
-
-    # # mix: only df=6 or df=2 are possible here 
-    # if dof_mix == 6:
-    #     p_mix = chi2_sf_df6(dchi2_mix) 
-    # elif dof_mix == 4:
-    #     p_mix = chi2_sf_df4(dchi2_mix) 
-    # elif dof_mix == 2:
-    #     p_mix = math.exp(-0.5*max(0.0, dchi2_mix)) 
-    # else:
-    #     p_mix = float("nan")    
-
-    # z1_tex = norm_isf(p_tex) if (0 < p_tex < 1 and math.isfinite(p_tex)) else float("nan")
-
-    # # conditional adds: ddl are those of the added block
-    # dof_add_kin = 1 if (kin_fix is not None) else 3
-    # dof_add_tex = 1 if (tex_fix is not None) else 3
-
-    # if dof_add_kin == 1:
-    #     p_add_kin_given_tex = chi2_sf_df1(dchi2_add_kin_given_tex)
-    # else:
-    #     p_add_kin_given_tex = chi2_sf_df3(dchi2_add_kin_given_tex)
-
-    # if dof_add_tex == 1:
-    #     p_add_tex_given_kin = chi2_sf_df1(dchi2_add_tex_given_kin)
-    # else:
-    #     p_add_tex_given_kin = chi2_sf_df3(dchi2_add_tex_given_kin)
-
-    # # --- p-values: ddl depend on whether axes are fixed ---
-    # dof_tex = 1 if (tex_fix is not None) else 3
-    # dof_kin = 1 if (kin_fix is not None) else 3
-    # dof_mix = (1 if tex_fix is not None else 3) + (1 if kin_fix is not None else 3)  # 2 or 6
-
-    # # TEX
-    # p_tex = chi2_sf(dchi2_tex, dof_tex)
-    # z1_tex = norm_isf(p_tex) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
-    # z2_tex = norm_isf(p_tex/2.0) if (0.0 < p_tex < 1.0 and math.isfinite(p_tex)) else float("nan")
-
-    # # KIN
-    # p_kin = chi2_sf(dchi2_kin, dof_kin)
-    # z1_kin = norm_isf(p_kin) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
-    # z2_kin = norm_isf(p_kin/2.0) if (0.0 < p_kin < 1.0 and math.isfinite(p_kin)) else float("nan")
-
-    # # MIX (df=2 or 6)  -> closed forms for both
-    # p_mix = chi2_sf(dchi2_mix, dof_mix)
-    # z1_mix = norm_isf(p_mix) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
-    # z2_mix = norm_isf(p_mix/2.0) if (0.0 < p_mix < 1.0 and math.isfinite(p_mix)) else float("nan")
-
-    # # conditional adds: ddl are those of the added block
-    # dof_add_kin = 1 if (kin_fix is not None) else 3
-    # dof_add_tex = 1 if (tex_fix is not None) else 3
-
-    # p_add_kin_given_tex = chi2_sf(dchi2_add_kin_given_tex, dof_add_kin)
-    # p_add_tex_given_kin = chi2_sf(dchi2_add_tex_given_kin, dof_add_tex)
-
-    # H0-only -> (a0 + dip) comparison kept as before
-    p4 = chi2_sf_df4(dchi2_4dof)
-    z1_4 = norm_isf(p4) if (0.0 < p4 < 1.0) else float("nan")
-    z2_4 = norm_isf(p4/2.0) if (0.0 < p4 < 1.0) else float("nan")
-    a0_mix = float(beta_mx[0])
-    
-    # error bars
-    # Mono (isotrope)
-    # 1. For Monopole model (a0_mono)
+    # 1. Monopole Error
     X0w = solve_lower(L, X0)
     H0_mat = X0w.T @ X0w
-    
-    # Robust scalar extraction (fixes NumPy 1.25+ DeprecationWarning)
+    # Robust scalar extraction (NumPy 1.25+ compliant)
     if np.ndim(H0_mat) == 0 or H0_mat.size == 1:
         val = H0_mat.item()
         var_a0_mono = 1.0 / val if val > 0 else float('inf')
     else:
-        var_a0_mono = np.linalg.inv(H0_mat)[0, 0]
-        
-    err_a0_mono = math.sqrt(var_a0_mono)
+        # Cov matrix is (1+Nsurv, 1+Nsurv)
+        # Intercept is index 0
+        try:
+            Cov_mono = np.linalg.inv(H0_mat)
+            var_a0_mono = Cov_mono[0, 0]
+        except np.linalg.LinAlgError:
+            var_a0_mono = float('nan')
+    err_a0_mono = math.sqrt(var_a0_mono) if var_a0_mono > 0 else 0.0
 
-    # 2. For Mixed model (a0_mix)
+    # 2. Mixed Model Error
     Xmixw = solve_lower(L, X_mix)
     Hmix_mat = Xmixw.T @ Xmixw
-    
-    # Invert matrix (size ~7x7) to get variance of the first parameter (intercept)
     try:
         Cov_mix = np.linalg.inv(Hmix_mat)
-        var_a0_mix = Cov_mix[0, 0] 
+        var_a0_mix = Cov_mix[0, 0]
         err_a0_mix = math.sqrt(max(0.0, var_a0_mix))
     except np.linalg.LinAlgError:
-        err_a0_mix = float('nan') 
+        err_a0_mix = float('nan')
+
+    chi2_dip = chi2_tex
+    a0_mix = float(beta_mx[0])
     
+    # =========================================================================
+    # Output Dictionary
+    # =========================================================================
     out = dict(
         N=len(dmu), H0=H0_best,
         chi2_iso=chi2_iso, chi2_mono=chi2_mono, chi2_dip=chi2_dip,
 
         dchi2_4=dchi2_4dof, p4=p4, z1_4=z1_4, z2_4=z2_4,
 
-        # tex (canonical keys)
+        # tex stats
         dchi2_tex=dchi2_tex, p_tex=p_tex, z_tex=z1_tex, dof_tex=dof_tex,
-
-        # legacy/compat keys for tex (kept)
+        # legacy keys
         dchi2_3=dchi2_tex, p3=p_tex, z1_3=z1_tex, z2_3=z2_tex,
 
         a0=a0, 
-        a0_mix=a0_mix,              # Intercept from the full MIX model
-        err_a0_mono=err_a0_mono,    # Error on monopole intercept
-        err_a0_mix=err_a0_mix,      # Error on mix intercept
+        a0_mix=a0_mix,
+        err_a0_mono=err_a0_mono,
+        err_a0_mix=err_a0_mix,
         
         A_mu=A_mu, frac=frac,
         ra=ra_hat, dec=dec_hat, l=l_hat, b=b_hat,
@@ -733,14 +729,13 @@ def fit_dipole(tab, idx, args, cov_full=None):
         D_vec=D_vec,
         K_vec=K_vec,
 
-        # kinematic
+        # kinematic stats
         chi2_kin=chi2_kin, dchi2_kin=dchi2_kin, p_kin=p_kin, dof_kin=dof_kin,
         A_mu_kin=A_mu_kin, ra_kin=ra_k, dec_kin=dec_k, l_kin=l_k, b_kin=b_k, v_bulk=v_bulk,
-
-        # legacy/compat keys for kinematic
+        # legacy keys
         p3_kin=p_kin, z1_3_kin=z1_kin, z2_3_kin=z2_kin,
 
-        # mixed
+        # mixed stats
         chi2_mix=chi2_mix, dchi2_mix=dchi2_mix, p_mix=p_mix, dof_mix=dof_mix,
         z1_mix=z1_mix, z2_mix=z2_mix,
 
@@ -757,7 +752,10 @@ def fit_dipole(tab, idx, args, cov_full=None):
     if surv_name and (surv_name in names):
         out["surveys"] = np.array(tab[surv_name])[idx]
 
-    # --- MW template / "corset" checks (inchangés) ---
+    # --- Auxiliary Checks (MW / Dust) ---
+    # Kept basic (no survey marginalization applied here to keep them as raw diagnostics)
+    # If users want deep systematics check, the survey test above is the main one.
+    
     if getattr(args, "mwcheck", False):
         tname = (getattr(args, "mwtemp", "p2") or "p2").lower()
         if tname == "sinb":
@@ -779,16 +777,15 @@ def fit_dipole(tab, idx, args, cov_full=None):
         dchi2_mw = chi2_mono - chi2_mw
         dchi2_dip_given_mw = chi2_mw - chi2_mwdip
 
-        p_mw = chi2_sf_df1(dchi2_mw)
-        p_dip_given_mw = chi2_sf_df3(dchi2_dip_given_mw)
+        p_mw = chi2_sf(dchi2_mw, 1)
+        p_dip_given_mw = chi2_sf(dchi2_dip_given_mw, 3)
 
         D_mw = beta_mwdip[-3:]
         A_mu_mw = float(np.linalg.norm(D_mw))
 
         if A_mu_mw > 0:
-            Dx, Dy, Dz = D_mw
-            ra_mw  = (math.degrees(math.atan2(Dy, Dx)) + 360.0) % 360.0
-            dec_mw = math.degrees(math.asin(Dz / A_mu_mw))
+            ra_mw  = (math.degrees(math.atan2(D_mw[1], D_mw[0])) + 360.0) % 360.0
+            dec_mw = math.degrees(math.asin(D_mw[2] / A_mu_mw))
             l_mw, b_mw = radec_to_gal_l_b(ra_mw, dec_mw)
         else:
             ra_mw = dec_mw = l_mw = b_mw = float("nan")
@@ -812,7 +809,7 @@ def fit_dipole(tab, idx, args, cov_full=None):
             ra_mw=ra_mw, dec_mw=dec_mw, l_mw=l_mw, b_mw=b_mw
         ))
 
-    # --- Dust analysis (inchangée) ---
+    # --- Dust Analysis ---
     dust = None
     dustcol = None
     if args.dustcheck:
@@ -831,16 +828,15 @@ def fit_dipole(tab, idx, args, cov_full=None):
         dchi2_dust   = chi2_mono - chi2_d
         dchi2_dip_cd = chi2_d - chi2_ddip
 
-        p_dust = chi2_sf_df1(dchi2_dust)
-        p_cd   = chi2_sf_df3(dchi2_dip_cd)
+        p_dust = chi2_sf(dchi2_dust, 1)
+        p_cd   = chi2_sf(dchi2_dip_cd, 3)
 
         D_cd = beta_ddip[-3:]
         A_mu_cd = float(np.linalg.norm(D_cd))
 
         if A_mu_cd > 0:
-            Dx, Dy, Dz = D_cd
-            ra_cd = (math.degrees(math.atan2(Dy, Dx)) + 360.0) % 360.0
-            dec_cd = math.degrees(math.asin(Dz / A_mu_cd))
+            ra_cd = (math.degrees(math.atan2(D_cd[1], D_cd[0])) + 360.0) % 360.0
+            dec_cd = math.degrees(math.asin(D_cd[2] / A_mu_cd))
             l_cd, b_cd = radec_to_gal_l_b(ra_cd, dec_cd)
         else:
             ra_cd = dec_cd = l_cd = b_cd = float("nan")
@@ -1861,7 +1857,7 @@ def constant_N_test(tab, args, cov_full, zmins, draws=200, N0=0, model="tex",
             var = var + sigmu_v**2
         Lb = np.sqrt(np.maximum(var, 1e-30))
 
-    # --- Baseline H0: isotropic grid search (same as fit_dipole's first step) ---
+    # --- Baseline H0: isotropic grid search (same as fit_dipole's first step), executed only once--- 
     H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
     best = (1e300, None)
     for H0 in H0_grid:
@@ -2299,6 +2295,8 @@ def main():
     ap.add_argument("--dustcut", type=float, default=-1.0, help="If >0, keep only SN with dust <= dustcut.")
     ap.add_argument("--bcut", type=float, default=-1.0, help="If >0, keep only SN with |galactic b| >= bcut (deg).")
 
+    ap.add_argument("--marginalize_surveys", action="store_true", help="[Test 1] Add survey-specific intercepts to the design matrix to marginalize over cross-survey calibration offsets.")
+
     ap.add_argument("--dat", required=True)
     ap.add_argument("--cov", default="", help="Optional full covariance .cov (Pantheon style).")
     ap.add_argument("--use_cov", action="store_true", help="If set and --cov provided, use GLS with full cov.")
@@ -2510,65 +2508,7 @@ def main():
             print(f"\n[INFO] Saved scan data to {out_csv}")
         
         return        
-        # zmins = parse_list(args.scan_zmin_h0)
-        # zmins = sorted(list(set(zmins)))
-        
-        # print("\n=== Effective H0 Impact Scan (vs zmin) ===")
-        # print("# Comparing Isotropic Monopole vs Directional Mix (KIN+TEX)")
-        # print("# Formula: H0_eff = H0_grid * (1 - (ln10/5)*a0)")
-        # print(f"# Fixed zmax = {args.zmax}")
-        # print("-" * 110) # Un peu plus large pour les erreurs
-        # print(f"{'zmin':<8} {'N':<6} {'H0_mono':<10} {'err':<8} {'H0_mix':<10} {'err':<8} {'Delta_H0':<10}")
-        # print("-" * 110)
 
-        # ln10_over_5 = math.log(10.0) / 5.0
-        # rows_h0 = []
-
-        # for zmin_cut in zmins:
-        #     m = base_mask & (z_all >= zmin_cut) & (z_all <= args.zmax)
-        #     idx = np.where(m)[0]
-            
-        #     if len(idx) < 10:
-        #         continue
-
-        #     r = fit_dipole(tab, idx, args, cov_full=cov_full)
-
-        #     h0_grid = r['H0']
-        #     a0_iso  = r['a0']
-        #     a0_mix  = r['a0_mix']
-            
-        #     # Récupération des erreurs (ajoutées à l'étape 1)
-        #     e_iso = r.get('err_a0_mono', 0.0)
-        #     e_mix = r.get('err_a0_mix', 0.0)
-            
-        #     # Calcul des H0 effectifs
-        #     h0_eff_mono = h0_grid * (1.0 - ln10_over_5 * a0_iso)
-        #     h0_eff_mix  = h0_grid * (1.0 - ln10_over_5 * a0_mix)
-            
-        #     # Propagation des erreurs
-        #     # sigma_H = H * (ln10/5) * sigma_a0
-        #     sig_h0_mono = h0_grid * ln10_over_5 * e_iso
-        #     sig_h0_mix  = h0_grid * ln10_over_5 * e_mix
-            
-        #     delta = h0_eff_mix - h0_eff_mono
-
-        #     print(f"{zmin_cut:<8.4f} {r['N']:<6d} "
-        #           f"{h0_eff_mono:<10.3f} {sig_h0_mono:<8.3f} "
-        #           f"{h0_eff_mix:<10.3f} {sig_h0_mix:<8.3f} "
-        #           f"{delta:<+10.3f}")
-            
-        #     # On sauvegarde aussi les erreurs dans le CSV
-        #     rows_h0.append((zmin_cut, r['N'], h0_eff_mono, sig_h0_mono, h0_eff_mix, sig_h0_mix))
-
-        # if rows_h0:
-        #     out_csv = "h0_impact_scan.csv"
-        #     with open(out_csv, "w") as f:
-        #         f.write("zmin,N,H0_mono,err_mono,H0_mix,err_mix\n")
-        #         for row in rows_h0:
-        #             f.write(f"{row[0]},{row[1]},{row[2]},{row[3]},{row[4]},{row[5]}\n")
-        #     print(f"\n[INFO] Saved scan data to {out_csv}")
-        
-        # return
     
     zbin_results = []
     zb = parse_bins(args.zbins)
@@ -3251,62 +3191,72 @@ def main():
         n = unitvec_from_radec(ra, dec)
         zinv = 1.0 / np.maximum(z, 1e-6)
 
+        # --- GESTION DES AXES FIXES ---
         tex_fix = _parse_lb(getattr(args, "fix_tex_axis", ""))
         kin_fix = _parse_lb(getattr(args, "fix_kin_axis", ""))
-
-        proj_tex = proj_kin = None
+        
+        proj_tex = None
         if tex_fix is not None:
-            l0,b0 = tex_fix
-            dgal = _uvec_from_lb(l0,b0)
+            dgal = _uvec_from_lb(*tex_fix)
             deq_tex = (EQ2GAL.T @ dgal).astype(float)
             proj_tex = (n @ deq_tex).astype(float)
-
-        X0 = np.ones((len(dmu),1), float)
-
-        if tex_fix is None:
-            X_tex = np.column_stack([np.ones(len(dmu)), n[:,0], n[:,1], n[:,2]])
-        else:
-            X_tex = np.column_stack([np.ones(len(dmu)), proj_tex])
-
-        if kin_fix is None:
-            X_kin = np.column_stack([np.ones(len(dmu)), n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])
-        else:
-            X_kin = np.column_stack([np.ones(len(dmu)), proj_kin*zinv])
-
-        mix_cols = [np.ones(len(dmu))]
-        mix_cols += ([n[:,0],n[:,1],n[:,2]] if tex_fix is None else [proj_tex])
-        mix_cols += ([n[:,0]*zinv,n[:,1]*zinv,n[:,2]*zinv] if kin_fix is None else [proj_kin*zinv])
-        X_mix = np.column_stack(mix_cols)
-
-        proj_tex = proj_kin = None
-        if tex_fix is not None:
-            l0,b0 = tex_fix
-            dgal = _uvec_from_lb(l0,b0)
-            deq_tex = (EQ2GAL.T @ dgal).astype(float)
-            proj_tex = (n @ deq_tex).astype(float)
-
+            
+        proj_kin = None
         if kin_fix is not None:
-            l0,b0 = kin_fix
-            dgal = _uvec_from_lb(l0,b0)
+            dgal = _uvec_from_lb(*kin_fix)
             deq_kin = (EQ2GAL.T @ dgal).astype(float)
             proj_kin = (n @ deq_kin).astype(float)
 
-        X0 = np.ones((len(dmu),1), float)
+        # --- Marginalisation management ---
+        survey_cols_main = []
+        if getattr(args, "marginalize_surveys", False):
+            # On réutilise la même logique que fit_dipole
+            if args.surveycol:
+                s_col_name = args.surveycol
+            else:
+                s_col_name = find_col(names, ["IDSURVEY", "idSURVEY", "survey", "SURVEY", "SURVEYID"])
+            
+            if s_col_name and (s_col_name in names):
+                s_ids = np.array(tab[s_col_name])[idx0]
+                unique_ids = np.unique(s_ids)
+                # Référence: le plus fréquent
+                counts = [np.sum(s_ids == uid) for uid in unique_ids]
+                ref_survey = unique_ids[np.argmax(counts)]
+                
+                other_surveys = [uid for uid in unique_ids if uid != ref_survey]
+                for uid in other_surveys:
+                    col = (s_ids == uid).astype(float)
+                    survey_cols_main.append(col)
+                print(f"[Main] Marginalizing permutations over {len(survey_cols_main)} survey nuisance parameters.")
+
+        # Fonction helper locale pour le main
+        def build_X_main(phys_cols):
+            base = [np.ones(len(dmu))] + survey_cols_main
+            if phys_cols:
+                base += phys_cols
+            return np.column_stack(base)
+
+        # --- Construction des Matrices X (Alignées avec fit_dipole) ---
+        X0 = build_X_main([])
 
         if tex_fix is None:
-            X_tex = np.column_stack([np.ones(len(dmu)), n[:,0], n[:,1], n[:,2]])
+            X_tex = build_X_main([n[:,0], n[:,1], n[:,2]])
         else:
-            X_tex = np.column_stack([np.ones(len(dmu)), proj_tex])
+            X_tex = build_X_main([proj_tex])
 
         if kin_fix is None:
-            X_kin = np.column_stack([np.ones(len(dmu)), n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])
+            X_kin = build_X_main([n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])
         else:
-            X_kin = np.column_stack([np.ones(len(dmu)), proj_kin*zinv])
+            X_kin = build_X_main([proj_kin*zinv])
 
-        mix_cols = [np.ones(len(dmu))]
-        mix_cols += ([n[:,0],n[:,1],n[:,2]] if tex_fix is None else [proj_tex])
-        mix_cols += ([n[:,0]*zinv,n[:,1]*zinv,n[:,2]*zinv] if kin_fix is None else [proj_kin*zinv])
-        X_mix = np.column_stack(mix_cols)
+        mix_c = []
+        if tex_fix is None: mix_c += [n[:,0], n[:,1], n[:,2]]
+        else: mix_c += [proj_tex]
+        
+        if kin_fix is None: mix_c += [n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv]
+        else: mix_c += [proj_kin*zinv]
+        
+        X_mix = build_X_main(mix_c)
 
 
         # whitened objects
