@@ -9,6 +9,7 @@ expansion field using Type Ia Supernovae data. It supports:
 - Tomographic binning.
 - Full covariance matrix support.
 - Robustness tests: Influence diagnostics, Directional Jackknife, Constant-N tests.
+- Joint Pantheon--CF4 null calibration (T14).
 - Null hypothesis testing via footprint-aware permutations.
 
 Usage:
@@ -17,11 +18,13 @@ Usage:
 Author:  Michaël Vaillant
 Affil:   Meta-Connexions, Toulouse, France
 License: MIT
-Version: 6.6.0
+Version: 7.2.1
+DOI:     10.5281/zenodo.18603301 (older version)
 Paper:   "Dipole mapping of the local Hubble expansion", Vaillant (2026)
 
 Dependencies:
     numpy, scipy, matplotlib
+    astropy (optional, required for CF4 geometry / FITS / NPZ sampling)
 """
 import argparse, math
 import numpy as np
@@ -335,6 +338,290 @@ def rand_rotation_matrix(rng):
         [2*(x*z - y*w), 2*(y*z + x*w), 1-2*(x*x+y*y)],
     ], dtype=float)
     return R
+
+
+
+def metric_distance_mpc(z, H0, q0=-0.55):
+    """
+    Low-z metric distance used for CF4 geometry.
+    We reuse the same O(z^2) cosmography as hubble_mu_model and convert
+    luminosity distance to metric distance through D = D_L / (1 + z).
+    """
+    z = np.asarray(z, dtype=float)
+    dl_mpc = (C_LIGHT / H0) * z * (1.0 + 0.5 * (1.0 - q0) * z)
+    return dl_mpc / np.maximum(1.0 + z, 1e-12)
+
+
+def _cf4_axis_tag(s):
+    s = str(s).upper()
+    if "SGX" in s:
+        return "SGX"
+    if "SGY" in s:
+        return "SGY"
+    if "SGZ" in s:
+        return "SGZ"
+    return s.strip()
+
+
+def _load_fits_cube_linear(path):
+    """
+    Load a 3D FITS cube and return:
+      data          : ndarray with array order already matching axes_ordered
+      axes_ordered  : list of 3 axis vectors in the same order as data dimensions
+      names_ordered : list of axis tags (e.g. ['SGZ','SGY','SGX'])
+
+    FITS stores axis metadata as axis1/axis2/axis3 while numpy arrays are read as
+    (axis3, axis2, axis1). We therefore reorder the axis vectors accordingly.
+    """
+    try:
+        from astropy.io import fits
+    except ImportError as e:
+        raise RuntimeError(
+            "CF4 FITS support requires astropy. Install it with: python -m pip install astropy"
+        ) from e
+
+    data = np.asarray(fits.getdata(path), dtype=float)
+    hdr = fits.getheader(path)
+    if data.ndim != 3:
+        raise RuntimeError(f"CF4 FITS cube must be 3D: {path} has ndim={data.ndim}")
+
+    shape_fits = tuple(int(hdr.get(f"NAXIS{i}", data.shape[::-1][i-1])) for i in (1, 2, 3))
+    if shape_fits[::-1] != data.shape:
+        # Keep the actual data shape if header is inconsistent.
+        shape_fits = data.shape[::-1]
+
+    axes_meta = []
+    for i in (1, 2, 3):
+        n = int(shape_fits[i - 1])
+        crpix = float(hdr.get(f"CRPIX{i}", 1.0))
+        crval = float(hdr.get(f"CRVAL{i}", 0.0))
+        cdelt = float(hdr.get(f"CDELT{i}", 1.0))
+        ctype = _cf4_axis_tag(hdr.get(f"CTYPE{i}", f"AXIS{i}"))
+        axis = crval + (np.arange(n, dtype=float) + 1.0 - crpix) * cdelt
+        axes_meta.append((ctype, axis))
+
+    # Numpy order after FITS read: axis3, axis2, axis1
+    axes_ordered = [axes_meta[2][1], axes_meta[1][1], axes_meta[0][1]]
+    names_ordered = [axes_meta[2][0], axes_meta[1][0], axes_meta[0][0]]
+    return data, axes_ordered, names_ordered
+
+
+def _interp_cube_regular(data, axes_ordered, names_ordered, x_sgx, y_sgy, z_sgz):
+    from scipy.interpolate import RegularGridInterpolator
+
+    coord_map = {
+        "SGX": np.asarray(x_sgx, dtype=float),
+        "SGY": np.asarray(y_sgy, dtype=float),
+        "SGZ": np.asarray(z_sgz, dtype=float),
+    }
+
+    pts = np.column_stack([coord_map[name] for name in names_ordered])
+    interp = RegularGridInterpolator(
+        tuple(np.asarray(ax, dtype=float) for ax in axes_ordered),
+        np.asarray(data, dtype=float),
+        bounds_error=False,
+        fill_value=np.nan,
+    )
+    return np.asarray(interp(pts), dtype=float)
+
+
+def _sn_supergalactic_cartesian(tab, args, z_geom_col):
+    """
+    Convert the full SN table positions to Supergalactic Cartesian coordinates.
+    Units are controlled by --cf4_grid_units and --cf4_h.
+    """
+    global RA_COL, DEC_COL
+
+    try:
+        from astropy.coordinates import SkyCoord, Supergalactic
+        import astropy.units as u
+    except ImportError as e:
+        raise RuntimeError(
+            "CF4 geometry support requires astropy. Install it with: python -m pip install astropy"
+        ) from e
+
+    ra = np.asarray(tab[RA_COL], dtype=float)
+    dec = np.asarray(tab[DEC_COL], dtype=float)
+    z = np.asarray(tab[z_geom_col], dtype=float)
+
+    dist_mpc = metric_distance_mpc(z, float(args.cf4_h0_geom), q0=float(args.cf4_q0_geom))
+    if str(args.cf4_grid_units).lower() in ("mpc/h", "mpch"):
+        dist_mpc = dist_mpc * float(args.cf4_h)
+
+    sc = SkyCoord(ra=ra * u.deg, dec=dec * u.deg, distance=dist_mpc * u.Mpc, frame="icrs")
+    sg = sc.transform_to(Supergalactic())
+
+    x = sg.cartesian.x.to_value(u.Mpc)
+    y = sg.cartesian.y.to_value(u.Mpc)
+    zc = sg.cartesian.z.to_value(u.Mpc)
+    r = np.sqrt(x * x + y * y + zc * zc)
+    urx = x / np.maximum(r, 1e-30)
+    ury = y / np.maximum(r, 1e-30)
+    urz = zc / np.maximum(r, 1e-30)
+    return x, y, zc, urx, ury, urz, np.asarray(z, dtype=float)
+
+
+def _cf4pp_to_grid_index(coord, delta, N=128, L=1000.0):
+    """Match the official CF4++ example script indexing in a box of size L."""
+    coord = np.asarray(coord, dtype=float)
+    coord = coord + L / 2.0
+    index = np.floor(coord / delta).astype(int)
+    return np.clip(index, 0, N - 1)
+
+
+def _sample_cf4pp_npz(path, tab, args, z_geom_col):
+    """
+    Sample the public CF4++ NPZ product directly, following the official example.
+    Returns a dict with dmu and auxiliary fields.
+    """
+    if str(args.cf4_grid_units).lower() not in ("mpc/h", "mpch"):
+        print("[WARN] CF4++ NPZ grids are tabulated on a 1000 Mpc/h box. Using --cf4_grid_units != Mpc/h may mis-sample the grid.")
+
+    x, y, zc, urx, ury, urz, z_geom = _sn_supergalactic_cartesian(tab, args, z_geom_col)
+    dat = np.load(path)
+
+    required = ["vr_mean_CF4pp", "vr_std_CF4pp", "d_mean_CF4pp", "d_std_CF4pp"]
+    missing = [k for k in required if k not in dat]
+    if missing:
+        raise RuntimeError(f"CF4++ NPZ is missing expected keys: {', '.join(missing)}")
+
+    ngrid = int(dat["vr_mean_CF4pp"].shape[0])
+    box = 1000.0
+    delta = box / float(ngrid)
+    ix = _cf4pp_to_grid_index(x, delta=delta, N=ngrid, L=box)
+    iy = _cf4pp_to_grid_index(y, delta=delta, N=ngrid, L=box)
+    iz = _cf4pp_to_grid_index(zc, delta=delta, N=ngrid, L=box)
+
+    vr = float(args.cf4_vel_scale) * np.asarray(dat["vr_mean_CF4pp"][ix, iy, iz], dtype=float)
+    vr_err = float(args.cf4_vel_scale) * np.asarray(dat["vr_std_CF4pp"][ix, iy, iz], dtype=float)
+    d = np.asarray(dat["d_mean_CF4pp"][ix, iy, iz], dtype=float)
+    d_err = np.asarray(dat["d_std_CF4pp"][ix, iy, iz], dtype=float)
+
+    # Optional Cartesian velocity cross-check (official file also contains v_mean/v_std)
+    if "v_mean_CF4pp" in dat and np.asarray(dat["v_mean_CF4pp"]).ndim == 4 and dat["v_mean_CF4pp"].shape[0] == 3:
+        vxyz = float(args.cf4_vel_scale) * np.asarray(dat["v_mean_CF4pp"][:, ix, iy, iz], dtype=float)
+        vxyz_err = float(args.cf4_vel_scale) * np.asarray(dat["v_std_CF4pp"][:, ix, iy, iz], dtype=float) if "v_std_CF4pp" in dat else np.full((3, len(ix)), np.nan)
+        vr_from_vec = vxyz[0] * urx + vxyz[1] * ury + vxyz[2] * urz
+        diff = np.nanmedian(np.abs(vr - vr_from_vec)) if vr.size else np.nan
+        if np.isfinite(diff) and diff > 1e-6:
+            print(f"[INFO] CF4++ NPZ radial velocity differs from projected Cartesian velocity by median |Δ|={diff:.4f} km/s; keeping vr_mean_CF4pp as authoritative.")
+    else:
+        vxyz = None
+        vxyz_err = None
+
+    dmu = (5.0 / math.log(10.0)) * vr / (C_LIGHT * np.maximum(z_geom, 1e-6))
+
+    return {
+        "dmu": np.asarray(dmu, dtype=float),
+        "vr": vr,
+        "vr_err": vr_err,
+        "delta": d,
+        "delta_err": d_err,
+        "vxyz": vxyz,
+        "vxyz_err": vxyz_err,
+    }
+
+
+def load_cf4_template(tab, args):
+    """
+    Build a CF4 external template on the full SN table.
+
+    Supported modes:
+      1) Direct template file (--cf4_template) with same row order/length as --dat.
+         Accepted columns include CF4_DMU / T_CF4 or CF4_VRAD.
+      2) Public CF4++ NPZ product (--cf4pp_npz), sampled exactly as in the official example.
+      3) Official-like CF4 SGX/SGY/SGZ FITS cubes, sampled at SN positions.
+
+    Returned array is always a distance-modulus template Δμ_CF4.
+    """
+    names = list(tab.dtype.names)
+    z_geom_col = args.cf4_zcol if args.cf4_zcol else find_col(names, ["zCMB", "zcmb", "ZCMB", "zHEL", "zhel", "zHD", "zhd", "z"])
+    if z_geom_col is None or z_geom_col not in names:
+        raise RuntimeError("Could not determine CF4 geometry redshift column. Use --cf4_zcol.")
+
+    # ------------------------------------------------------------------
+    # Mode A: precomputed template table (same order/length as the SN table)
+    # ------------------------------------------------------------------
+    if getattr(args, "cf4_template", ""):
+        tpath = args.cf4_template
+        arr = np.genfromtxt(tpath, names=True, dtype=None, encoding=None, delimiter=None)
+
+        if getattr(arr, "dtype", None) is not None and arr.dtype.names is not None:
+            tnames = list(arr.dtype.names)
+            dmu_col = find_col(tnames, ["CF4_DMU", "cf4_dmu", "T_CF4", "t_cf4", "CF4_TEMPLATE", "cf4_template"])
+            vr_col = find_col(tnames, ["CF4_VRAD", "cf4_vrad", "VRAD_CF4", "vrad_cf4", "VRAD"])
+            if dmu_col:
+                out = np.asarray(arr[dmu_col], dtype=float)
+            elif vr_col:
+                z_geom = np.asarray(tab[z_geom_col], dtype=float)
+                out = (5.0 / math.log(10.0)) * (float(args.cf4_vel_scale) * np.asarray(arr[vr_col], dtype=float)) / (C_LIGHT * np.maximum(z_geom, 1e-6))
+            else:
+                raise RuntimeError(
+                    f"CF4 template file {tpath} must contain CF4_DMU/T_CF4 or CF4_VRAD. Available: {', '.join(tnames)}"
+                )
+        else:
+            out = np.asarray(arr, dtype=float)
+            if out.ndim != 1:
+                raise RuntimeError(f"CF4 template file {tpath} could not be parsed as a 1D template.")
+
+        if len(out) != len(tab):
+            raise RuntimeError(
+                f"CF4 template length ({len(out)}) does not match SN table length ({len(tab)}). "
+                "Current implementation expects identical row order."
+            )
+        return out
+
+    # ------------------------------------------------------------------
+    # Mode B: public CF4++ NPZ product
+    # ------------------------------------------------------------------
+    if getattr(args, "cf4pp_npz", ""):
+        prod = _sample_cf4pp_npz(args.cf4pp_npz, tab, args, z_geom_col)
+        if getattr(args, "cf4_export_template", ""):
+            out = args.cf4_export_template
+            cols = [prod["vr"], prod["vr_err"], prod["delta"], prod["delta_err"], prod["dmu"]]
+            header = "CF4_VRAD CF4_VRAD_ERR CF4_DELTA CF4_DELTA_ERR CF4_DMU"
+            np.savetxt(out, np.column_stack(cols), header=header, fmt="%.8f")
+            print(f"[INFO] Saved CF4++ sampled template table to {out}")
+        return prod["dmu"]
+
+    # ------------------------------------------------------------------
+    # Mode C: SGX/SGY/SGZ FITS cubes sampled at the SN positions
+    # ------------------------------------------------------------------
+    if getattr(args, "cf4_sgx_grid", "") and getattr(args, "cf4_sgy_grid", "") and getattr(args, "cf4_sgz_grid", ""):
+        x, y, zc, urx, ury, urz, z_geom = _sn_supergalactic_cartesian(tab, args, z_geom_col)
+
+        data_x, axes_x, names_x = _load_fits_cube_linear(args.cf4_sgx_grid)
+        data_y, axes_y, names_y = _load_fits_cube_linear(args.cf4_sgy_grid)
+        data_z, axes_z, names_z = _load_fits_cube_linear(args.cf4_sgz_grid)
+
+        # Require common grid geometry.
+        if not (names_x == names_y == names_z):
+            raise RuntimeError("CF4 SGX/SGY/SGZ cubes do not share the same axis tags.")
+        for ax0, ax1, ax2 in zip(axes_x, axes_y, axes_z):
+            if (len(ax0) != len(ax1)) or (len(ax0) != len(ax2)) or np.nanmax(np.abs(ax0 - ax1)) > 0 or np.nanmax(np.abs(ax0 - ax2)) > 0:
+                raise RuntimeError("CF4 SGX/SGY/SGZ cubes do not share the same grid coordinates.")
+
+        vx = float(args.cf4_vel_scale) * _interp_cube_regular(data_x, axes_x, names_x, x, y, zc)
+        vy = float(args.cf4_vel_scale) * _interp_cube_regular(data_y, axes_y, names_y, x, y, zc)
+        vz = float(args.cf4_vel_scale) * _interp_cube_regular(data_z, axes_z, names_z, x, y, zc)
+
+        vr = vx * urx + vy * ury + vz * urz
+        dmu = (5.0 / math.log(10.0)) * vr / (C_LIGHT * np.maximum(z_geom, 1e-6))
+
+        if getattr(args, "cf4_export_template", ""):
+            out = args.cf4_export_template
+            hdr = "CF4_VRAD CF4_DMU"
+            np.savetxt(out, np.column_stack([vr, dmu]), header=hdr, fmt="%.8f")
+            print(f"[INFO] Saved CF4 template table to {out}")
+
+        return dmu
+
+    if getattr(args, "cf4_test", False) or getattr(args, "cf4_tomo", False):
+        raise RuntimeError(
+            "CF4 requested but no input was provided. Use either --cf4_template, --cf4pp_npz, or the 3 grid files "
+            "--cf4_sgx_grid / --cf4_sgy_grid / --cf4_sgz_grid."
+        )
+    return None
 
 
 def fit_dipole(tab, idx, args, cov_full=None):
@@ -939,6 +1226,20 @@ def chi2_from_Q(yw, Q):
     t = Q.T @ yw
     return float(yw @ yw - t @ t)
 
+def chi2_cols_from_Q(Yw, Q):
+    """Vectorized chi2_from_Q for multiple whitened right-hand sides.
+
+    Parameters
+    ----------
+    Yw : ndarray, shape (N, M)
+        Whitened data vectors stacked by columns.
+    Q : ndarray, shape (N, p)
+        Reduced QR orthonormal basis for the whitened design matrix.
+    """
+    Yw = np.asarray(Yw, dtype=float)
+    proj = Q.T @ Yw
+    return np.sum(Yw * Yw, axis=0) - np.sum(proj * proj, axis=0)
+
 def save_and_plot_null(stats, obs_val, out_root):
     """
     Save permutation stats to CSV and generate the PNG plot.
@@ -1009,10 +1310,6 @@ def save_and_plot_null(stats, obs_val, out_root):
         plt.savefig(out_png, dpi=200)
         plt.close(fig)
         print(f"[INFO] Plot saved to {out_png}")
-
-    except Exception as e:
-        print(f"[WARN] Could not generate plot: {e}")
-
 
     except Exception as e:
         print(f"[WARN] Could not generate plot: {e}")
@@ -1618,10 +1915,8 @@ def influence_diagnostics(tab, idx0, args, cov_full, H0_ref, mode="mix",
         for j in ridx[:dropone]:
             idx_sub = idx0[np.arange(len(idx0)) != j]
             rr = fit_dipole(tab, idx_sub, args, cov_full=cov_full)
-
-            dtex = angsep_lb_deg(base_tex[0], base_tex[1], rr.get("l", float('nan')), rr.get("b", float('nan')))                    if (np.isfinite(base_tex[0]) and np.isfinite(rr.get("l", np.nan))) else float('nan')
-
-            dkin = angsep_lb_deg(base_kin[0], base_kin[1], rr.get("l_kin", float('nan')), rr.get("b_kin", float('nan')))                    if (np.isfinite(base_kin[0]) and np.isfinite(rr.get("l_kin", np.nan))) else float('nan')
+            dtex = angsep_lb_deg(base_tex[0], base_tex[1], rr.get("l", float('nan')), rr.get("b", float('nan'))) if (np.isfinite(base_tex[0]) and np.isfinite(rr.get("l", np.nan))) else float('nan')
+            dkin = angsep_lb_deg(base_kin[0], base_kin[1], rr.get("l_kin", float('nan')), rr.get("b_kin", float('nan'))) if (np.isfinite(base_kin[0]) and np.isfinite(rr.get("l_kin", np.nan))) else float('nan')
 
             print(f" - drop idx={int(idx0[j])}: Δχ²_tex={rr['dchi2_tex']-base['dchi2_tex']:+.3f} "
                   f"Δθ_tex={dtex:.2f}° | Δχ²_kin={rr['dchi2_kin']-base['dchi2_kin']:+.3f} "
@@ -2260,6 +2555,632 @@ def run_null_mock_tomography(tab, base_mask, args, cov_full, zbin_results):
         print(f"Note: with 0 hits, a simple upper bound is p_shell < {1.0/n_mocks:.3e} (at 1/N resolution).")
 
 
+
+def run_joint_single_flow_null(tab, base_mask, args, cov_full, cf4_dmu_full):
+    """
+    [T14] Joint single-flow null on the Pantheon--CF4 conjunction.
+
+    Event definition (simple event-based version):
+      E = {
+            Δχ²_TEX(peak shell)           >= peak_min,
+            Δχ²_TEX(adjacent shell)       <= adj_max,
+            Δχ²_CF4(union shell)          <= cf4_union_max,
+            Δχ²(TEX|CF4, union shell)     >= tex_cf4_min
+          }
+
+    Null model M0 (simple version):
+        dμ = a0 + β_CF4 t_CF4 + ε
+    on the union of the requested tomography shells, with ε drawn from the same
+    covariance model used by the main analysis. The shell morphology is evaluated
+    on the same locked TEX axis as T2/T13.
+    """
+    if cf4_dmu_full is None:
+        raise RuntimeError("T14 requires a precomputed CF4 template.")
+    if not getattr(args, "fix_tex_axis", ""):
+        raise RuntimeError("T14 requires --fix_tex_axis so that the shell morphology remains anchored to T1/T2.")
+
+    zb = parse_bins(args.zbins)
+    if not zb:
+        raise RuntimeError("T14 requires --zbins.")
+
+    peak_bin = max(1, int(getattr(args, "t14_peak_bin", 2))) - 1
+    adj_bin = max(1, int(getattr(args, "t14_adj_bin", 3))) - 1
+    if peak_bin >= len(zb) or adj_bin >= len(zb):
+        raise RuntimeError("T14 peak/adjacent bin indices are outside the provided --zbins list.")
+
+    z_all = np.asarray(tab[Z_COL], dtype=float)
+    zlo_u = min(a for a, b in zb)
+    zhi_u = max(b for a, b in zb)
+    mU = base_mask & (z_all > zlo_u) & (z_all <= zhi_u)
+    idxU = np.where(mU)[0]
+    if idxU.size < 10:
+        raise RuntimeError("Not enough SNe in the union of shells for T14.")
+
+    raU = np.asarray(tab[RA_COL], dtype=float)[idxU]
+    decU = np.asarray(tab[DEC_COL], dtype=float)[idxU]
+    muU = np.asarray(tab[MU_COL], dtype=float)[idxU]
+    zU = np.asarray(tab[Z_COL], dtype=float)[idxU]
+    muerrU = np.maximum(np.asarray(tab[MUERR_COL], dtype=float)[idxU], 1e-6)
+    tU = np.asarray(cf4_dmu_full, dtype=float)[idxU]
+
+    use_cov = (cov_full is not None) and bool(getattr(args, "use_cov", False))
+    if use_cov:
+        CU = cov_full[np.ix_(idxU, idxU)].copy()
+        if args.sigint > 0:
+            CU[np.diag_indices_from(CU)] += args.sigint**2
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(zU, 1e-6)
+            sigmu_v = (5.0 / np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            CU[np.diag_indices_from(CU)] += sigmu_v**2
+        LU = whiten_from_cov(CU)
+    else:
+        sig2U = muerrU * muerrU + args.sigint * args.sigint
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(zU, 1e-6)
+            sigmu_v = (5.0 / np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            sig2U = sig2U + sigmu_v * sigmu_v
+        LU = np.sqrt(sig2U)
+
+    # Global H0 on the union shell interval (same logic as T13)
+    H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
+    best = (1e300, None)
+    for H0 in H0_grid:
+        mu_th = hubble_mu_model(zU, H0, q0=args.q0)
+        chi2 = chi2_only(LU, (muU - mu_th))
+        if chi2 < best[0]:
+            best = (chi2, H0)
+    H0_best = float(best[1])
+    mu_th_U = hubble_mu_model(zU, H0_best, q0=args.q0)
+    dmuU = (muU - mu_th_U).astype(float)
+
+    nU = unitvec_from_radec(raU, decU)
+    dgal_tex = _uvec_from_lb(*_parse_lb(args.fix_tex_axis))
+    deq_tex = (EQ2GAL.T @ dgal_tex).astype(float)
+    proj_tex_U = (nU @ deq_tex).astype(float)
+
+    X0U = np.ones((len(dmuU), 1), float)
+    Xcf4U = np.column_stack([np.ones(len(dmuU)), tU])
+    Xcf4texU = np.column_stack([np.ones(len(dmuU)), tU, proj_tex_U])
+
+    # Observed union stats and null mean under M0 = MONO + CF4
+    b0U, c0U = gls_fit_and_chi2(LU, X0U, dmuU)
+    bCU, cCU = gls_fit_and_chi2(LU, Xcf4U, dmuU)
+    bCTU, cCTU = gls_fit_and_chi2(LU, Xcf4texU, dmuU)
+
+    obs_cf4_union = float(c0U - cCU)
+    obs_tex_given_cf4 = float(cCU - cCTU)
+    mu0_U = Xcf4U @ bCU
+    mu0w_U = solve_lower(LU, mu0_U)
+
+    # Precompute union QR bases
+    Q0U = precompute_Q(solve_lower(LU, X0U))
+    Qcf4U = precompute_Q(solve_lower(LU, Xcf4U))
+    Qcf4texU = precompute_Q(solve_lower(LU, Xcf4texU))
+
+    # Peak and adjacent shell definitions
+    shell_defs = {}
+    for label, ibin in (("peak", peak_bin), ("adj", adj_bin)):
+        zlo, zhi = zb[ibin]
+        loc = np.where((zU > zlo) & (zU <= zhi))[0]
+        if loc.size < 10:
+            raise RuntimeError(f"T14: not enough SNe in {label} shell ({zlo:.3f}-{zhi:.3f}).")
+
+        if use_cov:
+            idxB = idxU[loc]
+            CB = cov_full[np.ix_(idxB, idxB)].copy()
+            if args.sigint > 0:
+                CB[np.diag_indices_from(CB)] += args.sigint**2
+            if getattr(args, "sigv", 0.0) > 0:
+                z_safe = np.maximum(zU[loc], 1e-6)
+                sigmu_v = (5.0 / np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+                CB[np.diag_indices_from(CB)] += sigmu_v**2
+            LB = whiten_from_cov(CB)
+        else:
+            sig2B = muerrU[loc] * muerrU[loc] + args.sigint * args.sigint
+            if getattr(args, "sigv", 0.0) > 0:
+                z_safe = np.maximum(zU[loc], 1e-6)
+                sigmu_v = (5.0 / np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+                sig2B = sig2B + sigmu_v * sigmu_v
+            LB = np.sqrt(sig2B)
+
+        X0B = np.ones((loc.size, 1), float)
+        XtexB = np.column_stack([np.ones(loc.size), proj_tex_U[loc]])
+
+        _, c0B = gls_fit_and_chi2(LB, X0B, dmuU[loc])
+        _, cTB = gls_fit_and_chi2(LB, XtexB, dmuU[loc])
+
+        shell_defs[label] = {
+            "ibin": ibin,
+            "zlo": zlo,
+            "zhi": zhi,
+            "loc": loc,
+            "L": LB,
+            "Q0": precompute_Q(solve_lower(LB, X0B)),
+            "Qtex": precompute_Q(solve_lower(LB, XtexB)),
+            "obs": float(c0B - cTB),
+        }
+
+    obs_peak = shell_defs["peak"]["obs"]
+    obs_adj = shell_defs["adj"]["obs"]
+
+    # Event thresholds.
+    # If the user does not provide explicit thresholds, anchor them automatically
+    # to the exact observed values from the current run. This guarantees that the
+    # reported event is evaluated against an "at least as extreme as observed"
+    # definition with no rounding drift between the printed values and the actual
+    # comparisons performed in code.
+    peak_min = obs_peak if (getattr(args, "t14_peak_min", None) is None) else float(args.t14_peak_min)
+    adj_max = obs_adj if (getattr(args, "t14_adj_max", None) is None) else float(args.t14_adj_max)
+    cf4_union_max = obs_cf4_union if (getattr(args, "t14_cf4_union_max", None) is None) else float(args.t14_cf4_union_max)
+    tex_cf4_min = obs_tex_given_cf4 if (getattr(args, "t14_tex_cf4_min", None) is None) else float(args.t14_tex_cf4_min)
+
+    obs_joint = (
+        (obs_peak >= peak_min) and
+        (obs_adj <= adj_max) and
+        (obs_cf4_union <= cf4_union_max) and
+        (obs_tex_given_cf4 >= tex_cf4_min)
+    )
+
+    nmock = max(1, int(getattr(args, "nmock", 1) or 1))
+    batch = max(1, int(getattr(args, "t14_batch", 256) or 256))
+    rng = np.random.default_rng(int(getattr(args, "seed", 0)) + 1400)
+
+    hits_peak = hits_adj = hits_cf4 = hits_texcf4 = hits_joint = 0
+    store = []
+
+    t0 = time.time()
+    last = t0
+    done = 0
+    while done < nmock:
+        m = min(batch, nmock - done)
+        G = rng.standard_normal((len(idxU), m))
+        if use_cov:
+            YwU = mu0w_U[:, None] + G
+            YU = mu0_U[:, None] + (LU @ G)
+        else:
+            YwU = mu0w_U[:, None] + G
+            YU = mu0_U[:, None] + (LU[:, None] * G)
+
+        chi0U = chi2_cols_from_Q(YwU, Q0U)
+        chiCU = chi2_cols_from_Q(YwU, Qcf4U)
+        chiCTU = chi2_cols_from_Q(YwU, Qcf4texU)
+        d_cf4_union = chi0U - chiCU
+        d_tex_cf4 = chiCU - chiCTU
+
+        locP = shell_defs["peak"]["loc"]
+        LP = shell_defs["peak"]["L"]
+        YP = YU[locP, :]
+        YwP = solve_lower(LP, YP)
+        d_peak = chi2_cols_from_Q(YwP, shell_defs["peak"]["Q0"]) - chi2_cols_from_Q(YwP, shell_defs["peak"]["Qtex"])
+
+        locA = shell_defs["adj"]["loc"]
+        LA = shell_defs["adj"]["L"]
+        YA = YU[locA, :]
+        YwA = solve_lower(LA, YA)
+        d_adj = chi2_cols_from_Q(YwA, shell_defs["adj"]["Q0"]) - chi2_cols_from_Q(YwA, shell_defs["adj"]["Qtex"])
+
+        cond_peak = (d_peak >= peak_min)
+        cond_adj = (d_adj <= adj_max)
+        cond_cf4 = (d_cf4_union <= cf4_union_max)
+        cond_texcf4 = (d_tex_cf4 >= tex_cf4_min)
+        cond_joint = cond_peak & cond_adj & cond_cf4 & cond_texcf4
+
+        hits_peak += int(np.sum(cond_peak))
+        hits_adj += int(np.sum(cond_adj))
+        hits_cf4 += int(np.sum(cond_cf4))
+        hits_texcf4 += int(np.sum(cond_texcf4))
+        hits_joint += int(np.sum(cond_joint))
+
+        if getattr(args, "t14_csv", ""):
+            block = np.column_stack([d_peak, d_adj, d_cf4_union, d_tex_cf4, cond_joint.astype(int)])
+            store.append(block)
+
+        done += m
+        last = _progress(done, nmock, t0, last, label="T14(joint-null)")
+
+    sys.stderr.write("\n")
+    sys.stderr.flush()
+
+    p_peak = (1.0 + hits_peak) / (1.0 + nmock)
+    p_adj = (1.0 + hits_adj) / (1.0 + nmock)
+    p_cf4 = (1.0 + hits_cf4) / (1.0 + nmock)
+    p_texcf4 = (1.0 + hits_texcf4) / (1.0 + nmock)
+    p_joint = (1.0 + hits_joint) / (1.0 + nmock)
+
+    print("# Null model M0: dmu = a0 + beta_CF4 t_CF4 + epsilon on the union shell interval")
+    print(f"# Union shells: ({zlo_u:.3f},{zhi_u:.3f}]  N={len(idxU)}  H0_best={H0_best:.2f}  beta_CF4={float(bCU[1]):+.5f}")
+    print(f"# Peak shell: bin #{peak_bin+1} = ({shell_defs['peak']['zlo']:.3f},{shell_defs['peak']['zhi']:.3f}]")
+    print(f"# Adjacent shell: bin #{adj_bin+1} = ({shell_defs['adj']['zlo']:.3f},{shell_defs['adj']['zhi']:.3f}]")
+    print("Observed metrics:")
+    print(f"  Δχ²_TEX(peak shell)        = {obs_peak:.9f}")
+    print(f"  Δχ²_TEX(adjacent shell)    = {obs_adj:.9f}")
+    print(f"  Δχ²_CF4(union shell)       = {obs_cf4_union:.9f}")
+    print(f"  Δχ²(TEX|CF4, union shell)  = {obs_tex_given_cf4:.9f}")
+    print("Event thresholds:")
+    print(f"  peak >= {peak_min:.9f} ; adjacent <= {adj_max:.9f} ; CF4_union <= {cf4_union_max:.9f} ; TEX|CF4 >= {tex_cf4_min:.9f}")
+    print(f"  Observed event satisfied: {'yes' if obs_joint else 'no'}")
+    print(f"  N_mock = {nmock}")
+    print("Empirical probabilities under M0:")
+    print(f"  p_peak        = {p_peak:.8e}   ({hits_peak}/{nmock})")
+    print(f"  p_adj         = {p_adj:.8e}   ({hits_adj}/{nmock})")
+    print(f"  p_cf4_weak    = {p_cf4:.8e}   ({hits_cf4}/{nmock})")
+    print(f"  p_tex_given_cf4 = {p_texcf4:.8e}   ({hits_texcf4}/{nmock})")
+    print(f"  p_joint       = {p_joint:.8e}   ({hits_joint}/{nmock})")
+
+    if getattr(args, "t14_csv", ""):
+        try:
+            arr = np.vstack(store) if store else np.zeros((0, 5), float)
+            header = "dchi2_tex_peak,dchi2_tex_adj,dchi2_cf4_union,dchi2_tex_given_cf4,joint_hit"
+            np.savetxt(args.t14_csv, arr, delimiter=",", header=header, fmt="%.12e")
+
+            meta_path = args.t14_csv + ".meta.txt"
+            with open(meta_path, "w", encoding="utf-8") as fmeta:
+                fmeta.write(f"csv={args.t14_csv}\n")
+                fmeta.write(f"nmock={nmock}\n")
+                fmeta.write(f"peak_obs={obs_peak:.12e}\n")
+                fmeta.write(f"adj_obs={obs_adj:.12e}\n")
+                fmeta.write(f"cf4_obs={obs_cf4_union:.12e}\n")
+                fmeta.write(f"texcf4_obs={obs_tex_given_cf4:.12e}\n")
+                fmeta.write(f"peak_min={peak_min:.12e}\n")
+                fmeta.write(f"adj_max={adj_max:.12e}\n")
+                fmeta.write(f"cf4_union_max={cf4_union_max:.12e}\n")
+                fmeta.write(f"tex_cf4_min={tex_cf4_min:.12e}\n")
+                fmeta.write(f"observed_event_satisfied={int(obs_joint)}\n")
+                fmeta.write(f"p_peak={p_peak:.12e} ({hits_peak}/{nmock})\n")
+                fmeta.write(f"p_adj={p_adj:.12e} ({hits_adj}/{nmock})\n")
+                fmeta.write(f"p_cf4_weak={p_cf4:.12e} ({hits_cf4}/{nmock})\n")
+                fmeta.write(f"p_tex_given_cf4={p_texcf4:.12e} ({hits_texcf4}/{nmock})\n")
+                fmeta.write(f"p_joint={p_joint:.12e} ({hits_joint}/{nmock})\n")
+
+            print(f"[INFO] Saved T14 mock metrics to {args.t14_csv}")
+            print(f"[INFO] Saved T14 metadata to {meta_path}")
+        except Exception as e:
+            print(f"[WARN] Could not save T14 CSV: {e}")
+
+
+def fit_cf4_models(tab, idx, args, cov_full=None, cf4_dmu_full=None):
+    """
+    External-template regression with CF4.
+
+    Models:
+      MONO       = a0
+      CF4        = a0 + beta_cf4 * t_cf4
+      CF4+TEX    = a0 + beta_cf4 * t_cf4 + TEX
+      CF4+KIN    = a0 + beta_cf4 * t_cf4 + KIN
+      CF4+MIX    = a0 + beta_cf4 * t_cf4 + TEX + KIN
+    """
+    global RA_COL, DEC_COL, MU_COL, MUERR_COL, Z_COL
+
+    if cf4_dmu_full is None:
+        raise RuntimeError("fit_cf4_models requires a precomputed CF4 template.")
+
+    names = list(tab.dtype.names)
+    ra_name = RA_COL
+    dec_name = DEC_COL
+    mu_name = MU_COL
+    mue_name = MUERR_COL
+    z_name = Z_COL
+
+    if args.surveycol:
+        surv_name = args.surveycol
+    else:
+        surv_name = find_col(names, ["IDSURVEY", "idSURVEY", "survey", "SURVEY", "SURVEYID"])
+
+    ra = np.asarray(tab[ra_name], dtype=float)[idx]
+    dec = np.asarray(tab[dec_name], dtype=float)[idx]
+    mu = np.asarray(tab[mu_name], dtype=float)[idx]
+    z = np.asarray(tab[z_name], dtype=float)[idx]
+    muerr = np.maximum(np.asarray(tab[mue_name], dtype=float)[idx], 1e-6)
+    t_cf4 = np.asarray(cf4_dmu_full, dtype=float)[idx]
+
+    if not np.all(np.isfinite(t_cf4)):
+        nbad = int(np.sum(~np.isfinite(t_cf4)))
+        raise RuntimeError(f"CF4 template contains {nbad} non-finite values on the selected sample.")
+
+    if (cov_full is not None) and args.use_cov:
+        C = cov_full[np.ix_(idx, idx)].copy()
+        if args.sigint > 0:
+            C[np.diag_indices_from(C)] += args.sigint**2
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(z, 1e-6)
+            sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            C[np.diag_indices_from(C)] += sigmu_v**2
+        L = whiten_from_cov(C)
+    else:
+        sig2 = muerr * muerr + args.sigint * args.sigint
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(z, 1e-6)
+            sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            sig2 = sig2 + sigmu_v * sigmu_v
+        L = np.sqrt(sig2)
+
+    # Same analytical H0 optimization as fit_dipole
+    H0_ref = 70.0
+    mu_th_ref = hubble_mu_model(z, H0_ref, q0=args.q0)
+    r_ref = (mu - mu_th_ref).astype(float)
+    ones = np.ones_like(r_ref)
+    y_w = solve_lower(L, r_ref)
+    ones_w = solve_lower(L, ones)
+    denom = float(np.dot(ones_w, ones_w))
+    if denom <= 0.0 or (not math.isfinite(denom)):
+        H0_best = H0_ref
+    else:
+        d = float(np.dot(ones_w, y_w)) / denom
+        H0_best = H0_ref * (10.0 ** (-d / 5.0))
+    if H0_best < args.h0min:
+        H0_best = args.h0min
+    elif H0_best > args.h0max:
+        H0_best = args.h0max
+
+    mu_th = hubble_mu_model(z, H0_best, q0=args.q0)
+    dmu = (mu - mu_th).astype(float)
+
+    n = unitvec_from_radec(ra, dec)
+    zinv = 1.0 / np.maximum(z, 1e-6)
+
+    tex_fix = _parse_lb(getattr(args, "fix_tex_axis", ""))
+    kin_fix = _parse_lb(getattr(args, "fix_kin_axis", ""))
+    proj_tex = None
+    proj_kin = None
+    if tex_fix is not None:
+        dgal = _uvec_from_lb(*tex_fix)
+        deq_tex = (EQ2GAL.T @ dgal).astype(float)
+        proj_tex = (n @ deq_tex).astype(float)
+    if kin_fix is not None:
+        dgal = _uvec_from_lb(*kin_fix)
+        deq_kin = (EQ2GAL.T @ dgal).astype(float)
+        proj_kin = (n @ deq_kin).astype(float)
+
+    survey_cols = []
+    if getattr(args, "marginalize_surveys", False):
+        if surv_name and (surv_name in names):
+            s_ids = np.asarray(tab[surv_name])[idx]
+            unique_ids = np.unique(s_ids)
+            counts = [np.sum(s_ids == uid) for uid in unique_ids]
+            ref_survey = unique_ids[np.argmax(counts)]
+            other_surveys = [uid for uid in unique_ids if uid != ref_survey]
+            for uid in other_surveys:
+                survey_cols.append((s_ids == uid).astype(float))
+
+    idx_start = 1 + len(survey_cols)
+
+    def build_design(phys_cols):
+        base = [np.ones(len(dmu)), *survey_cols]
+        if phys_cols:
+            base += phys_cols
+        return np.column_stack(base)
+
+    X0 = build_design([])
+    Xcf4 = build_design([t_cf4])
+
+    if tex_fix is None:
+        Xcf4tex = build_design([t_cf4, n[:, 0], n[:, 1], n[:, 2]])
+    else:
+        Xcf4tex = build_design([t_cf4, proj_tex])
+
+    if kin_fix is None:
+        Xcf4kin = build_design([t_cf4, n[:, 0] * zinv, n[:, 1] * zinv, n[:, 2] * zinv])
+    else:
+        Xcf4kin = build_design([t_cf4, proj_kin * zinv])
+
+    mix_cols = [t_cf4]
+    if tex_fix is None:
+        mix_cols += [n[:, 0], n[:, 1], n[:, 2]]
+    else:
+        mix_cols += [proj_tex]
+    if kin_fix is None:
+        mix_cols += [n[:, 0] * zinv, n[:, 1] * zinv, n[:, 2] * zinv]
+    else:
+        mix_cols += [proj_kin * zinv]
+    Xcf4mix = build_design(mix_cols)
+
+    beta0, chi2_mono = gls_fit_and_chi2(L, X0, dmu)
+    beta_cf4, chi2_cf4 = gls_fit_and_chi2(L, Xcf4, dmu)
+    beta_cf4tex, chi2_cf4tex = gls_fit_and_chi2(L, Xcf4tex, dmu)
+    beta_cf4kin, chi2_cf4kin = gls_fit_and_chi2(L, Xcf4kin, dmu)
+    beta_cf4mix, chi2_cf4mix = gls_fit_and_chi2(L, Xcf4mix, dmu)
+
+    dof_tex = 1 if (tex_fix is not None) else 3
+    dof_kin = 1 if (kin_fix is not None) else 3
+
+    dchi2_cf4 = chi2_mono - chi2_cf4
+    dchi2_tex_given_cf4 = chi2_cf4 - chi2_cf4tex
+    dchi2_kin_given_cf4 = chi2_cf4 - chi2_cf4kin
+    dchi2_mix_given_cf4 = chi2_cf4 - chi2_cf4mix
+    dchi2_tex_given_cf4kin = chi2_cf4kin - chi2_cf4mix
+    dchi2_kin_given_cf4tex = chi2_cf4tex - chi2_cf4mix
+
+    beta_idx = idx_start
+    beta_cf4_only = float(beta_cf4[beta_idx])
+    beta_cf4_tex = float(beta_cf4tex[beta_idx])
+    beta_cf4_kin = float(beta_cf4kin[beta_idx])
+    beta_cf4_mix = float(beta_cf4mix[beta_idx])
+
+    out = {
+        "N": len(dmu),
+        "H0": H0_best,
+        "chi2_mono": chi2_mono,
+        "chi2_cf4": chi2_cf4,
+        "chi2_cf4tex": chi2_cf4tex,
+        "chi2_cf4kin": chi2_cf4kin,
+        "chi2_cf4mix": chi2_cf4mix,
+        "dchi2_cf4": dchi2_cf4,
+        "dchi2_tex_given_cf4": dchi2_tex_given_cf4,
+        "dchi2_kin_given_cf4": dchi2_kin_given_cf4,
+        "dchi2_mix_given_cf4": dchi2_mix_given_cf4,
+        "dchi2_tex_given_cf4kin": dchi2_tex_given_cf4kin,
+        "dchi2_kin_given_cf4tex": dchi2_kin_given_cf4tex,
+        "p_cf4": chi2_sf(dchi2_cf4, 1),
+        "p_tex_given_cf4": chi2_sf(dchi2_tex_given_cf4, dof_tex),
+        "p_kin_given_cf4": chi2_sf(dchi2_kin_given_cf4, dof_kin),
+        "p_mix_given_cf4": chi2_sf(dchi2_mix_given_cf4, dof_tex + dof_kin),
+        "p_tex_given_cf4kin": chi2_sf(dchi2_tex_given_cf4kin, dof_tex),
+        "p_kin_given_cf4tex": chi2_sf(dchi2_kin_given_cf4tex, dof_kin),
+        "beta_cf4": beta_cf4_only,
+        "beta_cf4_tex": beta_cf4_tex,
+        "beta_cf4_kin": beta_cf4_kin,
+        "beta_cf4_mix": beta_cf4_mix,
+        "t_cf4_rms": float(np.sqrt(np.mean(t_cf4 * t_cf4))),
+    }
+    return out
+
+
+def run_cf4_tomography(tab, base_mask, args, cov_full, cf4_dmu_full):
+    """
+    [T13] Locked-axis tomography with an external CF4 template.
+    Requires --zbins, --zbins_global, --fix_tex_axis and --fix_kin_axis.
+    """
+    if cf4_dmu_full is None:
+        raise RuntimeError("CF4 tomography requested but no CF4 template is available.")
+    if not args.zbins_global:
+        raise RuntimeError("--cf4_tomo requires --zbins_global.")
+    if not (args.fix_tex_axis and args.fix_kin_axis):
+        raise RuntimeError("--cf4_tomo requires --fix_tex_axis and --fix_kin_axis.")
+
+    zb = parse_bins(args.zbins)
+    if not zb:
+        raise RuntimeError("--cf4_tomo requires --zbins.")
+
+    z_all = np.asarray(tab[Z_COL], dtype=float)
+    zlo_u = min(a for a, b in zb)
+    zhi_u = max(b for a, b in zb)
+    mU = base_mask & (z_all > zlo_u) & (z_all <= zhi_u)
+    idxU = np.where(mU)[0]
+    if idxU.size < 10:
+        raise RuntimeError("Not enough SNe in union of bins for CF4 tomography.")
+
+    raU = np.asarray(tab[RA_COL], dtype=float)[idxU]
+    decU = np.asarray(tab[DEC_COL], dtype=float)[idxU]
+    muU = np.asarray(tab[MU_COL], dtype=float)[idxU]
+    zU = np.asarray(tab[Z_COL], dtype=float)[idxU]
+    muerrU = np.maximum(np.asarray(tab[MUERR_COL], dtype=float)[idxU], 1e-6)
+    tU = np.asarray(cf4_dmu_full, dtype=float)[idxU]
+
+    if (cov_full is not None) and args.use_cov:
+        CU = cov_full[np.ix_(idxU, idxU)].copy()
+        if args.sigint > 0:
+            CU[np.diag_indices_from(CU)] += args.sigint**2
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(zU, 1e-6)
+            sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            CU[np.diag_indices_from(CU)] += sigmu_v**2
+        LU = whiten_from_cov(CU)
+    else:
+        sig2U = muerrU * muerrU + args.sigint * args.sigint
+        if getattr(args, "sigv", 0.0) > 0:
+            z_safe = np.maximum(zU, 1e-6)
+            sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+            sig2U = sig2U + sigmu_v * sigmu_v
+        LU = np.sqrt(sig2U)
+
+    H0_grid = np.linspace(args.h0min, args.h0max, args.h0n)
+    best = (1e300, None)
+    for H0 in H0_grid:
+        mu_th = hubble_mu_model(zU, H0, q0=args.q0)
+        chi2 = chi2_only(LU, (muU - mu_th))
+        if chi2 < best[0]:
+            best = (chi2, H0)
+    H0_best = float(best[1])
+    mu_th_U = hubble_mu_model(zU, H0_best, q0=args.q0)
+    dmuU = (muU - mu_th_U).astype(float)
+
+    nU = unitvec_from_radec(raU, decU)
+    zinvU = 1.0 / np.maximum(zU, 1e-6)
+
+    dgal_tex = _uvec_from_lb(*_parse_lb(args.fix_tex_axis))
+    deq_tex = (EQ2GAL.T @ dgal_tex).astype(float)
+    proj_tex_U = (nU @ deq_tex).astype(float)
+
+    dgal_kin = _uvec_from_lb(*_parse_lb(args.fix_kin_axis))
+    deq_kin = (EQ2GAL.T @ dgal_kin).astype(float)
+    proj_kin_U = (nU @ deq_kin).astype(float)
+
+    X0U = np.ones((len(dmuU), 1), float)
+    Xcf4U = np.column_stack([np.ones(len(dmuU)), tU])
+    Xcf4texU = np.column_stack([np.ones(len(dmuU)), tU, proj_tex_U])
+    Xcf4kinU = np.column_stack([np.ones(len(dmuU)), tU, proj_kin_U * zinvU])
+    Xcf4mixU = np.column_stack([np.ones(len(dmuU)), tU, proj_tex_U, proj_kin_U * zinvU])
+
+    b0U, c0U = gls_fit_and_chi2(LU, X0U, dmuU)
+    bCU, cCU = gls_fit_and_chi2(LU, Xcf4U, dmuU)
+    bCTU, cCTU = gls_fit_and_chi2(LU, Xcf4texU, dmuU)
+    bCKU, cCKU = gls_fit_and_chi2(LU, Xcf4kinU, dmuU)
+    bCMU, cCMU = gls_fit_and_chi2(LU, Xcf4mixU, dmuU)
+
+    print("\n=== T13: CF4 tomography (GLOBAL H0 + LOCKED axes + external CF4 template) ===")
+    print(f"# Union z in ({zlo_u:.3f},{zhi_u:.3f}]  N={len(idxU)}  H0_best={H0_best:.2f}  (q0={args.q0})")
+    print("zbin           N   H0glob  dChi2_CF4_fit  beta_CF4_fit  dChi2(TEX|CF4)  A_tex_fit  dChi2(KIN|CF4)  v_bulk_fit  dChi2(TEX|CF4+KIN)  dChi2(KIN|CF4+TEX)")
+
+    for (zlo, zhi) in zb:
+        mB = base_mask & (z_all > zlo) & (z_all <= zhi)
+        idxB = np.where(mB)[0]
+        if idxB.size < 10:
+            print(f"{zlo:0.3f}-{zhi:0.3f}   {idxB.size:4d}  (skip)")
+            continue
+
+        raB = np.asarray(tab[RA_COL], dtype=float)[idxB]
+        decB = np.asarray(tab[DEC_COL], dtype=float)[idxB]
+        muB = np.asarray(tab[MU_COL], dtype=float)[idxB]
+        zB = np.asarray(tab[Z_COL], dtype=float)[idxB]
+        muerrB = np.maximum(np.asarray(tab[MUERR_COL], dtype=float)[idxB], 1e-6)
+        tB = np.asarray(cf4_dmu_full, dtype=float)[idxB]
+
+        dmuB = (muB - hubble_mu_model(zB, H0_best, q0=args.q0)).astype(float)
+        if (cov_full is not None) and args.use_cov:
+            CB = cov_full[np.ix_(idxB, idxB)].copy()
+            if args.sigint > 0:
+                CB[np.diag_indices_from(CB)] += args.sigint**2
+            if getattr(args, "sigv", 0.0) > 0:
+                z_safe = np.maximum(zB, 1e-6)
+                sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+                CB[np.diag_indices_from(CB)] += sigmu_v**2
+            LB = whiten_from_cov(CB)
+        else:
+            sig2B = muerrB * muerrB + args.sigint * args.sigint
+            if getattr(args, "sigv", 0.0) > 0:
+                z_safe = np.maximum(zB, 1e-6)
+                sigmu_v = (5.0/np.log(10.0)) * (args.sigv / (C_LIGHT * z_safe))
+                sig2B = sig2B + sigmu_v * sigmu_v
+            LB = np.sqrt(sig2B)
+
+        nB = unitvec_from_radec(raB, decB)
+        zinvB = 1.0 / np.maximum(zB, 1e-6)
+        proj_tex_B = (nB @ deq_tex).astype(float)
+        proj_kin_B = (nB @ deq_kin).astype(float)
+
+        X0B = np.ones((len(dmuB), 1), float)
+        Xcf4B = np.column_stack([np.ones(len(dmuB)), tB])
+        Xcf4texB = np.column_stack([np.ones(len(dmuB)), tB, proj_tex_B])
+        Xcf4kinB = np.column_stack([np.ones(len(dmuB)), tB, proj_kin_B * zinvB])
+        Xcf4mixB = np.column_stack([np.ones(len(dmuB)), tB, proj_tex_B, proj_kin_B * zinvB])
+
+        b0, c0 = gls_fit_and_chi2(LB, X0B, dmuB)
+        bC, cC = gls_fit_and_chi2(LB, Xcf4B, dmuB)
+        bCT, cCT = gls_fit_and_chi2(LB, Xcf4texB, dmuB)
+        bCK, cCK = gls_fit_and_chi2(LB, Xcf4kinB, dmuB)
+        bCM, cCM = gls_fit_and_chi2(LB, Xcf4mixB, dmuB)
+
+        dchi2_cf4_fit = c0 - cC
+        dchi2_tex_cf4_fit = cC - cCT
+        dchi2_kin_cf4_fit = cC - cCK
+        dchi2_tex_cf4kin_fit = cCK - cCM
+        dchi2_kin_cf4tex_fit = cCT - cCM
+        A_tex_fit = abs(float(bCT[2]))
+        v_bulk_fit = (math.log(10.0) / 5.0) * C_LIGHT * abs(float(bCK[2]))
+        beta_cf4_fit = float(bC[1])
+
+        print(
+            f"{zlo:0.3f}-{zhi:0.3f}  {len(idxB):4d}  {H0_best:6.2f}  {dchi2_cf4_fit:12.2f}  {beta_cf4_fit:+12.5f}  "
+            f"{dchi2_tex_cf4_fit:13.2f}  {A_tex_fit:0.6f}  {dchi2_kin_cf4_fit:13.2f}  {v_bulk_fit:9.1f}  "
+            f"{dchi2_tex_cf4kin_fit:18.2f}  {dchi2_kin_cf4tex_fit:18.2f}"
+        )
+
+    print("# Global union deltas:")
+    print(
+        f"#  Δχ²_CF4={c0U-cCU:.3f}  Δχ²(TEX|CF4)={cCU-cCTU:.3f}  Δχ²(KIN|CF4)={cCU-cCKU:.3f}  Δχ²(MIX|CF4)={cCU-cCMU:.3f}"
+    )
+
+
 # ---------- main ----------
 def main():
     global RA_COL, DEC_COL, MU_COL, MUERR_COL, Z_COL
@@ -2350,6 +3271,33 @@ def main():
     # ap.add_argument("--null_mock_tomo_n", type=int, default=1000, help="Number of Gaussian realizations for --null_mock_tomo (default: 1000).")
     ap.add_argument("--scan_zmin_h0", default="", help="Comma-separated zmin values to scan for effective H0 impact (e.g. '0,0.01,0.02,0.03,0.04').")
 
+    # [T12/T13] External CF4 template / grid support
+    ap.add_argument("--cf4_test", action="store_true", help="[T12] Run external-template regression with a CF4 template.")
+    ap.add_argument("--cf4_tomo", action="store_true", help="[T13] Run locked-axis tomography with a CF4 template (requires --zbins_global and fixed axes).")
+    ap.add_argument("--cf4_template", default="", help="Optional precomputed CF4 template table with the same row order/length as --dat. Accepted columns: CF4_DMU or CF4_VRAD.")
+    ap.add_argument("--cf4pp_npz", default="", help="Public CF4++ NPZ grid product (e.g. CF4pp_mean_std_grids.npz) sampled directly at the SN positions.")
+    ap.add_argument("--cf4_sgx_grid", default="", help="CF4 FITS cube for the Supergalactic X velocity component.")
+    ap.add_argument("--cf4_sgy_grid", default="", help="CF4 FITS cube for the Supergalactic Y velocity component.")
+    ap.add_argument("--cf4_sgz_grid", default="", help="CF4 FITS cube for the Supergalactic Z velocity component.")
+    ap.add_argument("--cf4_export_template", default="", help="If non-empty, export the sampled CF4 template table. For CF4++ NPZ this includes VRAD/VRAD_ERR/DELTA/DELTA_ERR/DMU; for FITS cubes it includes VRAD and DMU.")
+    ap.add_argument("--cf4_zcol", default="", help="Redshift column used only for CF4 geometry/template conversion. Recommended: zCMB.")
+    ap.add_argument("--cf4_h0_geom", type=float, default=74.6, help="H0 used to convert SN redshift to CF4 geometry distance (default 74.6 km/s/Mpc).")
+    ap.add_argument("--cf4_q0_geom", type=float, default=-0.55, help="q0 used for CF4 geometry distance (default -0.55).")
+    ap.add_argument("--cf4_grid_units", default="Mpc/h", choices=["Mpc", "Mpc/h"], help="Distance unit of the CF4 grid coordinates.")
+    ap.add_argument("--cf4_h", type=float, default=0.746, help="Dimensionless h used when the CF4 grid is in Mpc/h (default 0.746).")
+    ap.add_argument("--cf4_vel_scale", type=float, default=1.0, help="Scale factor applied to sampled CF4 velocities before converting to Δμ. For the official CF4 site products this may need to be 52.")
+
+    # [T14] Joint single-flow null on the Pantheon--CF4 conjunction
+    ap.add_argument("--t14_joint_null", action="store_true", help="[T14] Joint single-flow null on the Pantheon--CF4 conjunction.")
+    ap.add_argument("--t14_peak_bin", type=int, default=2, help="1-based z-bin index used for the shell peak in T14 (default: 2).")
+    ap.add_argument("--t14_adj_bin", type=int, default=3, help="1-based z-bin index used for the adjacent shell in T14 (default: 3).")
+    ap.add_argument("--t14_peak_min", type=float, default=None, help="T14 event threshold: require Δχ²_TEX in the peak shell to be >= this value. If omitted, use the exact observed value from the current run.")
+    ap.add_argument("--t14_adj_max", type=float, default=None, help="T14 event threshold: require Δχ²_TEX in the adjacent shell to be <= this value. If omitted, use the exact observed value from the current run.")
+    ap.add_argument("--t14_cf4_union_max", type=float, default=None, help="T14 event threshold: require Δχ²_CF4 on the shell union to be <= this value. If omitted, use the exact observed value from the current run.")
+    ap.add_argument("--t14_tex_cf4_min", type=float, default=None, help="T14 event threshold: require Δχ²(TEX|CF4) on the shell union to be >= this value. If omitted, use the exact observed value from the current run.")
+    ap.add_argument("--t14_batch", type=int, default=256, help="Batch size for T14 mock generation (default: 256).")
+    ap.add_argument("--t14_csv", default="", help="Optional CSV output for the per-mock T14 metrics.")
+
     args = ap.parse_args()
 
     tab = load_table(args.dat)
@@ -2402,6 +3350,27 @@ def main():
         cov_full = load_cov(args.cov)
         if cov_full.shape[0] != len(tab):
                     raise RuntimeError(f"FATAL: Covariance size ({cov_full.shape[0]}) does not match Data table length ({len(tab)}). Check inputs.")
+
+    # optional external CF4 template (full-table array)
+    cf4_dmu_full = None
+    need_cf4_template = any([
+        bool(args.cf4_test),
+        bool(args.cf4_tomo),
+        bool(args.t14_joint_null),
+        bool(args.cf4_template),
+        bool(args.cf4pp_npz),
+        bool(args.cf4_sgx_grid),
+        bool(args.cf4_sgy_grid),
+        bool(args.cf4_sgz_grid),
+        bool(args.cf4_export_template),
+    ])
+    if need_cf4_template:
+        cf4_dmu_full = load_cf4_template(tab, args)
+        if cf4_dmu_full is not None:
+            z_geom_name = args.cf4_zcol if args.cf4_zcol else find_col(names, ["zCMB", "zcmb", "ZCMB", "zHEL", "zhel", "zHD", "zhd", "z"])
+            print(f"[INFO] CF4 template loaded: N={len(cf4_dmu_full)}  rms={np.sqrt(np.mean(np.asarray(cf4_dmu_full, dtype=float)**2)):.6e} mag")
+            if z_geom_name and (z_geom_name != Z_COL):
+                print(f"[INFO] Using {Z_COL} for the SN residual fit and {z_geom_name} for CF4 geometry/template sampling. This is intentional: zHD remains the Pantheon analysis redshift, while CF4 is usually sampled in a less pre-corrected frame such as zCMB.")
         
     def gal_unitvec_from_lb(l_deg, b_deg):
         l = np.deg2rad(l_deg); b = np.deg2rad(b_deg)
@@ -2788,6 +3757,12 @@ def main():
                     "N": r['N'],
                 })
 
+        if args.cf4_tomo:
+            run_cf4_tomography(tab, base_mask, args, cov_full, cf4_dmu_full)
+
+        if args.t14_joint_null:
+            run_joint_single_flow_null(tab, base_mask, args, cov_full, cf4_dmu_full)
+
         if not (args.make_pillar_plots or args.make_h0_residuals):
             return
 
@@ -2796,11 +3771,18 @@ def main():
     m = base_mask & (z_all <= args.zmax)
     idx0 = np.where(m)[0]
     r0 = fit_dipole(tab, idx0, args, cov_full=cov_full)
+    rcf4 = None
+    if args.cf4_test:
+        rcf4 = fit_cf4_models(tab, idx0, args, cov_full=cov_full, cf4_dmu_full=cf4_dmu_full)
+
+    if args.t14_joint_null:
+        run_joint_single_flow_null(tab, base_mask, args, cov_full, cf4_dmu_full)
 
     # ========= Mock  =========
     if args.null_mock_tomo:
             # Run the null test and exit
-            run_null_mock_tomography(tab, idx0, args, cov_full, n_mocks=1000)
+            run_null_mock_tomography(tab, base_mask, args, cov_full, zbin_results)
+            # run_null_mock_tomography(tab, idx0, args, cov_full, n_mocks=1000)
             return   
          
     # ========= Standalone sky map of Hubble residuals =========
@@ -3071,6 +4053,22 @@ def main():
         print(
             f"Incremental Δχ² (add TEX | KIN): {r0['dchi2_add_tex_given_kin']:.2f}   "
             f"(i.e. KIN → KIN+TEX)"
+        )
+
+
+    # ========= T12: CF4 external-template regression =========
+    if rcf4 is not None:
+        print("\n=== T12: external CF4 template regression ===")
+        print(f"χ²_CF4 (a0 + β_CF4·t_CF4): {rcf4['chi2_cf4']:.2f}")
+        print(f"Δχ²_CF4 (MONO → CF4, 1 dof): {rcf4['dchi2_cf4']:.2f}   p = {rcf4['p_cf4']:.3e}")
+        print(f"β_CF4 (CF4-only): {rcf4['beta_cf4']:+.6f}   rms(t_CF4) = {rcf4['t_cf4_rms']:.6e} mag")
+        print(f"Δχ²(TEX | CF4): {rcf4['dchi2_tex_given_cf4']:.2f}   p = {rcf4['p_tex_given_cf4']:.3e}")
+        print(f"Δχ²(KIN | CF4): {rcf4['dchi2_kin_given_cf4']:.2f}   p = {rcf4['p_kin_given_cf4']:.3e}")
+        print(f"Δχ²(MIX | CF4): {rcf4['dchi2_mix_given_cf4']:.2f}   p = {rcf4['p_mix_given_cf4']:.3e}")
+        print(f"Δχ²(TEX | CF4+KIN): {rcf4['dchi2_tex_given_cf4kin']:.2f}   p = {rcf4['p_tex_given_cf4kin']:.3e}")
+        print(f"Δχ²(KIN | CF4+TEX): {rcf4['dchi2_kin_given_cf4tex']:.2f}   p = {rcf4['p_kin_given_cf4tex']:.3e}")
+        print(
+            f"β_CF4(CF4+TEX)={rcf4['beta_cf4_tex']:+.6f}   β_CF4(CF4+KIN)={rcf4['beta_cf4_kin']:+.6f}   β_CF4(CF4+MIX)={rcf4['beta_cf4_mix']:+.6f}"
         )
 
     # ========= Dust test (if requested) =========
@@ -3462,6 +4460,88 @@ def main():
             print(f"  TEX p_emp ≈ {p_tex:.3e}")
             print(f"  KIN p_emp ≈ {p_kin:.3e}")
             print(f"  MIX p_emp ≈ {p_mix:.3e}")
+
+
+    # ======= T12 empirical p-values with CF4 =======
+    if (args.permute > 0) and args.cf4_test and (cf4_dmu_full is not None):
+        t_cf4 = np.asarray(cf4_dmu_full, dtype=float)[idx0]
+        if not np.all(np.isfinite(t_cf4)):
+            raise RuntimeError("Non-finite CF4 template values within the selected sample.")
+
+        X_cf4 = build_X_main([t_cf4])
+        if tex_fix is None:
+            X_cf4tex = build_X_main([t_cf4, n[:,0], n[:,1], n[:,2]])
+        else:
+            X_cf4tex = build_X_main([t_cf4, proj_tex])
+
+        if kin_fix is None:
+            X_cf4kin = build_X_main([t_cf4, n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv])
+        else:
+            X_cf4kin = build_X_main([t_cf4, proj_kin*zinv])
+
+        mix_cols_cf4 = [t_cf4]
+        if tex_fix is None:
+            mix_cols_cf4 += [n[:,0], n[:,1], n[:,2]]
+        else:
+            mix_cols_cf4 += [proj_tex]
+        if kin_fix is None:
+            mix_cols_cf4 += [n[:,0]*zinv, n[:,1]*zinv, n[:,2]*zinv]
+        else:
+            mix_cols_cf4 += [proj_kin*zinv]
+        X_cf4mix = build_X_main(mix_cols_cf4)
+
+        Xcf4w = solve_lower(L, X_cf4)
+        Xcf4texw = solve_lower(L, X_cf4tex)
+        Xcf4kinw = solve_lower(L, X_cf4kin)
+        Xcf4mixw = solve_lower(L, X_cf4mix)
+
+        Qcf4 = precompute_Q(Xcf4w)
+        Qcf4tex = precompute_Q(Xcf4texw)
+        Qcf4kin = precompute_Q(Xcf4kinw)
+        Qcf4mix = precompute_Q(Xcf4mixw)
+
+        dchi2_cf4_obs = chi2_from_Q(yw, Q0) - chi2_from_Q(yw, Qcf4)
+        dchi2_tex_cf4_obs = chi2_from_Q(yw, Qcf4) - chi2_from_Q(yw, Qcf4tex)
+        dchi2_kin_cf4_obs = chi2_from_Q(yw, Qcf4) - chi2_from_Q(yw, Qcf4kin)
+        dchi2_mix_cf4_obs = chi2_from_Q(yw, Qcf4) - chi2_from_Q(yw, Qcf4mix)
+        dchi2_tex_cf4kin_obs = chi2_from_Q(yw, Qcf4kin) - chi2_from_Q(yw, Qcf4mix)
+        dchi2_kin_cf4tex_obs = chi2_from_Q(yw, Qcf4tex) - chi2_from_Q(yw, Qcf4mix)
+
+        print("\n[DEBUG] dchi2_cf4_obs (QR)       =", f"{dchi2_cf4_obs:.6f}", "   vs fit:", f"{rcf4.get('dchi2_cf4', float('nan')):.6f}")
+        print("[DEBUG] dchi2_tex|cf4_obs (QR)  =", f"{dchi2_tex_cf4_obs:.6f}", "   vs fit:", f"{rcf4.get('dchi2_tex_given_cf4', float('nan')):.6f}")
+        print("[DEBUG] dchi2_kin|cf4_obs (QR)  =", f"{dchi2_kin_cf4_obs:.6f}", "   vs fit:", f"{rcf4.get('dchi2_kin_given_cf4', float('nan')):.6f}")
+
+        def _perm_pair(label, Qa, Qb, obs, seed_off):
+            if args.permute_whitened:
+                if args.permute_within_survey:
+                    return permute_pvalue_within_survey_whitened(
+                        yw, surveys, Qa, Qb, obs, args.permute,
+                        seed=args.seed + seed_off, progress=True
+                    )
+                return permute_pvalue_whitened(
+                    yw, Qa, Qb, obs, args.permute,
+                    seed=args.seed + seed_off, progress=True
+                )
+            if args.permute_within_survey:
+                # Recover the original design matrices from the associated Q branch is not possible here.
+                # Therefore CF4 permutation support is only enabled in the whitened mode.
+                raise RuntimeError("CF4 permutation support currently requires --permute_whitened.")
+            raise RuntimeError("CF4 permutation support currently requires --permute_whitened.")
+
+        p_cf4, ge_cf4, max_cf4, gap_cf4, top_cf4 = _perm_pair("CF4", Q0, Qcf4, dchi2_cf4_obs, 201)
+        p_tex_cf4, ge_tex_cf4, max_tex_cf4, gap_tex_cf4, top_tex_cf4 = _perm_pair("TEX|CF4", Qcf4, Qcf4tex, dchi2_tex_cf4_obs, 211)
+        p_kin_cf4, ge_kin_cf4, max_kin_cf4, gap_kin_cf4, top_kin_cf4 = _perm_pair("KIN|CF4", Qcf4, Qcf4kin, dchi2_kin_cf4_obs, 223)
+        p_mix_cf4, ge_mix_cf4, max_mix_cf4, gap_mix_cf4, top_mix_cf4 = _perm_pair("MIX|CF4", Qcf4, Qcf4mix, dchi2_mix_cf4_obs, 227)
+        p_tex_cf4kin, ge_tex_cf4kin, max_tex_cf4kin, gap_tex_cf4kin, top_tex_cf4kin = _perm_pair("TEX|CF4+KIN", Qcf4kin, Qcf4mix, dchi2_tex_cf4kin_obs, 229)
+        p_kin_cf4tex, ge_kin_cf4tex, max_kin_cf4tex, gap_kin_cf4tex, top_kin_cf4tex = _perm_pair("KIN|CF4+TEX", Qcf4tex, Qcf4mix, dchi2_kin_cf4tex_obs, 233)
+
+        print(f"\n[Permutation, CF4 external template] Nperm={args.permute}")
+        print(f"  CF4 only:        hits={ge_cf4:6d}  p_emp≈{p_cf4:.8e}        dchi2_obs={dchi2_cf4_obs:.3f}  max={max_cf4:.3f}  gap={gap_cf4:.3f}")
+        print(f"  TEX | CF4:       hits={ge_tex_cf4:6d}  p_emp≈{p_tex_cf4:.8e}   dchi2_obs={dchi2_tex_cf4_obs:.3f}  max={max_tex_cf4:.3f}  gap={gap_tex_cf4:.3f}")
+        print(f"  KIN | CF4:       hits={ge_kin_cf4:6d}  p_emp≈{p_kin_cf4:.8e}   dchi2_obs={dchi2_kin_cf4_obs:.3f}  max={max_kin_cf4:.3f}  gap={gap_kin_cf4:.3f}")
+        print(f"  MIX | CF4:       hits={ge_mix_cf4:6d}  p_emp≈{p_mix_cf4:.8e}   dchi2_obs={dchi2_mix_cf4_obs:.3f}  max={max_mix_cf4:.3f}  gap={gap_mix_cf4:.3f}")
+        print(f"  TEX | CF4+KIN:   hits={ge_tex_cf4kin:6d}  p_emp≈{p_tex_cf4kin:.8e}   dchi2_obs={dchi2_tex_cf4kin_obs:.3f}  max={max_tex_cf4kin:.3f}  gap={gap_tex_cf4kin:.3f}")
+        print(f"  KIN | CF4+TEX:   hits={ge_kin_cf4tex:6d}  p_emp≈{p_kin_cf4tex:.8e}   dchi2_obs={dchi2_kin_cf4tex_obs:.3f}  max={max_kin_cf4tex:.3f}  gap={gap_kin_cf4tex:.3f}")
 
     # ======= jackknife by survey =======
     if args.jackknife:
