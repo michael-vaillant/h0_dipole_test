@@ -17,13 +17,11 @@ This script performs a **generalized least-squares (GLS)** fit of the **local Hu
 
 ### Core observable
 
-The pipeline builds **Hubble residuals** (distance-modulus residuals)
+The pipeline builds **Hubble residuals** (distance-modulus residuals):
 
-\[
-\Delta \mu \equiv \mu_{\rm obs} - \mu_{\rm th}(z;H_0,q_0)
-\]
+**Δμ ≡ μ_obs − μ_th(z; H₀, q₀)**
 
-where \(H_0\) is obtained by grid minimization (and \(q_0\) is fixed by `--q0`).
+where **H₀** is obtained by grid minimization (and **q₀** is fixed by `--q0`).
 
 The fit can be done either:
 - with **diagonal errors** (WLS-style), or
@@ -31,13 +29,11 @@ The fit can be done either:
 
 ### Signal model: TEX / KIN / MIX decomposition
 
-The script supports a decomposition into nested models (all include a monopole/intercept \(a_0\)):
+The script supports a decomposition into nested models (all include a monopole/intercept **a₀**):
 
-- **MONO**: \( \Delta\mu = a_0 + \epsilon\)
-- **TEX** (constant-in-z dipole):  
-  \( \Delta\mu = a_0 + A_{\rm TEX}\,(\mathbf{n}\cdot\hat{\mathbf{d}}_{\rm TEX}) + \epsilon\)
-- **KIN** (kinematic bulk-flow-like dipole scaling as \(1/z\)):  
-  \( \Delta\mu = a_0 + A_{\rm KIN}\,(\mathbf{n}\cdot\hat{\mathbf{d}}_{\rm KIN})/z + \epsilon\)
+- **MONO**:  Δμ = a₀ + ε
+- **TEX** (constant-in-z dipole):  Δμ = a₀ + A_TEX · (n · d̂_TEX) + ε
+- **KIN** (kinematic bulk-flow-like dipole scaling as 1/z):  Δμ = a₀ + A_KIN · (n · d̂_KIN) / z + ε
 - **MIX** (TEX + KIN together)
 
 It reports:
@@ -61,8 +57,8 @@ With `--fix_tex_axis` and `--fix_kin_axis`, it can enforce **locked axes** (from
 The “pillar plot” mode (`--make_pillar_plots`) produces the 4-panel diagnostic figure used in the paper:
 - Δχ² from KIN by bin
 - Δχ² from TEX (on top of KIN) by bin
-- \(A_{\rm TEX}(z)\)
-- \(v_{\rm bulk}(z)\)
+- A_TEX(z)
+- v_bulk(z)
 
 ### Robustness / diagnostics included
 
@@ -73,7 +69,7 @@ The “pillar plot” mode (`--make_pillar_plots`) produces the 4-panel diagnost
 
 ### CF4++ external cross-validation (T12/T13) and conjunctive null calibration (T14)
 
-The script can sample an external reconstructed velocity field and convert it into a SN template \(t_{\rm CF4}\), then test:
+The script can sample an external reconstructed velocity field and convert it into a SN template t_CF4, then test:
 - **T12**: global regression and absorption tests (does CF4++ absorb TEX/KIN?)
 - **T13**: the same question **tomographically** on the locked-axis shell morphology
 - **T14**: a **joint single-flow null** calibration on the Pantheon–CF4 conjunction using correlated mocks on the shell union.
@@ -316,7 +312,7 @@ Below is a curated list of the most useful options, grouped by domain.
 ### Survey marginalization / robustness diagnostics
 
 - `--marginalize_surveys`: add survey intercept nuisance parameters (and refit them in each permutation when enabled).
-- `--influence`: run influence diagnostics (Cook’s distance + optional drop-one refits).
+- `--influence`: run influence diagnostics (Cook’s distance + optional exact drop-one refits).
 - `--influence_mode {mono,tex,kin,mix}`
 - `--influence_top <int>`, `--influence_dropone <int>`
 - `--jackknife`: leave-one-survey-out.
